@@ -155,8 +155,8 @@ impl Tool {
             Tool::InkBottle => tr_noop!("Click a shape to give it the current stroke colour and width."),
             Tool::Eyedropper => tr_noop!("Click a fill to pick its colour, gradient or bitmap (then pour it with the Paint Bucket), or a line to pick its colour, width and profile (then apply it with the Ink Bottle). With shapes selected, the picked style goes onto them. Shift-click picks into the other swatch only."),
             Tool::Camera => tr_noop!("Drag on the stage to pan the camera, drag the round handle to turn it, and use the wheel to zoom (each drag is one undo step). Picking the tool adds a camera if the scene has none."),
-            Tool::Hand => tr_noop!("Drag to pan the stage. Space works with any tool."),
-            Tool::Zoom => tr_noop!("Click to zoom in, Alt-click to zoom out. Ctrl+wheel zooms anywhere."),
+            Tool::Hand => tr_noop!("Drag to pan the stage. Space works with any tool. Shift+Space and drag turns the canvas about the middle of the view; Shift+R puts the turn back. Ctrl+Shift and drag zooms about that middle: up in, down out."),
+            Tool::Zoom => tr_noop!("Click to zoom in, Alt-click to zoom out. Ctrl+wheel zooms around the pointer. Ctrl+Shift and drag zooms about the middle of the view: up in, down out."),
         }
     }
 }
@@ -185,6 +185,30 @@ pub struct StageView {
     /// View › Clip Content Outside the Stage (#251): hide artwork on the pasteboard (it is still
     /// there, and still exported only where it is on the stage). Off: it shows, as in Animate.
     pub clip_to_stage: bool,
+    /// Clockwise degrees the picture is turned, about the centre of the canvas (ADR 0098).
+    /// The document stays upright. Pan stays in screen pixels, outside this turn.
+    pub rotation: f32,
+}
+
+impl StageView {
+    /// Turn the view by `delta` degrees. The stage point under the canvas centre stays.
+    pub fn orbit(&mut self, delta: f32) {
+        let delta = crate::viewturn::wrap_deg(delta);
+        if delta == 0.0 {
+            return;
+        }
+        self.pan = crate::viewturn::orbit_pan(self.pan, delta);
+        self.rotation = crate::viewturn::wrap_deg(self.rotation + delta);
+    }
+
+    /// Stand the view upright. Zoom stays, and the stage point under the canvas centre stays.
+    pub fn reset_rotation(&mut self) {
+        if self.rotation == 0.0 {
+            return;
+        }
+        self.pan = crate::viewturn::reset_pan(self.pan, self.rotation);
+        self.rotation = 0.0;
+    }
 }
 
 /// In-progress pointer gesture on the stage.
@@ -271,6 +295,12 @@ pub enum Drag {
     /// ruler or off the stage, where letting go deletes it.
     Guide { index: usize, off: bool },
     Pan,
+    /// Shift+Space drag: turning the view about the canvas centre (ADR 0098). `angle` is the
+    /// pointer's last angle about that centre, in degrees.
+    ViewRotate { angle: f32 },
+    /// Command+Shift drag: zooming about the canvas centre (ADR 0098). `y` is the press, `zoom`
+    /// is the zoom at the press, so dragging back to the press returns to that zoom.
+    ViewZoom { y: f32, zoom: f32 },
 }
 
 /// What a free-transform drag does.
@@ -662,7 +692,7 @@ impl App {
             updates: Default::default(),
             s: session,
             tool: Tool::Select,
-            view: StageView { zoom: 1.0, pan: egui::Vec2::ZERO, fit: true, fitted: None, clip_to_stage: false },
+            view: StageView { zoom: 1.0, pan: egui::Vec2::ZERO, fit: true, fitted: None, clip_to_stage: false, rotation: 0.0 },
             stage_cache: stage::Cache::default(),
             drag: Drag::None,
             hint_menu: None,
@@ -2143,7 +2173,7 @@ impl App {
                 self.tool = Tool::Eraser;
                 self.eraser = crate::erasertool::EraserOptions { size: 30.0, ..Default::default() };
                 self.brush_samples = (0..=30).map(|i| (anicraft_engine::geom::Vec2::new(720.0 + i as f32 * 12.0, 310.0), None)).collect();
-                crate::erasertool::commit(self, crate::pathtools::Xf { origin: egui::Pos2::ZERO, zoom: 1.0 });
+                crate::erasertool::commit(self, crate::pathtools::Xf::plain(egui::Pos2::ZERO, 1.0));
             }
             Some("eyedropper") => {
                 // The sample's sky gradient picked with the Eyedropper: the fill swatch holds it.
@@ -3043,16 +3073,22 @@ impl App {
     /// The stage point at the centre of the visible canvas.
     pub fn view_center_stage(&self) -> egui::Vec2 {
         let size = egui::vec2(self.s.doc.stage.width as f32, self.s.doc.stage.height as f32);
-        size * 0.5 - self.view.pan / self.view.zoom.max(1e-3)
+        // At 0° this is the upright formula: size/2 − pan/zoom.
+        crate::viewturn::center_stage(size, self.view.pan, self.view.rotation, self.view.zoom)
     }
 
     pub fn zoom_about(&mut self, canvas: egui::Rect, screen: egui::Pos2, new_zoom: f32) {
         let new_zoom = new_zoom.clamp(0.05, 64.0);
         let size = egui::vec2(self.s.doc.stage.width as f32, self.s.doc.stage.height as f32);
-        let origin = canvas.center() + self.view.pan - size * self.view.zoom * 0.5;
-        let stage_pt = (screen - origin) / self.view.zoom;
-        let new_origin = screen - stage_pt * new_zoom;
-        self.view.pan = new_origin - canvas.center() + size * new_zoom * 0.5;
+        if self.view.rotation == 0.0 {
+            let origin = canvas.center() + self.view.pan - size * self.view.zoom * 0.5;
+            let stage_pt = (screen - origin) / self.view.zoom;
+            let new_origin = screen - stage_pt * new_zoom;
+            self.view.pan = new_origin - canvas.center() + size * new_zoom * 0.5;
+            self.view.zoom = new_zoom;
+            return;
+        }
+        self.view.pan = crate::viewturn::zoom_pan(canvas.center(), self.view.pan, self.view.rotation, size, self.view.zoom, screen, new_zoom);
         self.view.zoom = new_zoom;
     }
 
@@ -3256,6 +3292,11 @@ impl App {
             return;
         }
         let control = keys == crate::a11y::Keyboard::Control;
+        // Shift+R stands the view upright (ADR 0098). Taken before the Rectangle tool's R:
+        // egui matches a bare R with Shift held as well.
+        if ctx.input_mut(|i| i.consume_key(Modifiers::SHIFT, Key::R)) {
+            self.view.reset_rotation();
+        }
         if !control {
             crate::motion_path::consume_keys(self, ctx);
             pathtools::consume_keys(self, ctx);

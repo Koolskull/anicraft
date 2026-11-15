@@ -32,12 +32,19 @@ pub struct StageGeo {
     pub zoom: f32,
     /// Previewing through the camera: artwork edits are paused.
     pub paused: bool,
+    /// Clockwise degrees the view is turned. Zero keeps [`to_stage`](Self::to_stage) upright.
+    pub rotation: f32,
+    /// Canvas centre, the point the picture turns about.
+    pub pivot: Pos2,
+    /// Screen-space pan, outside the turn.
+    pub pan: egui::Vec2,
 }
 
 impl StageGeo {
     pub fn to_stage(self, p: Pos2) -> (f32, f32) {
         let z = self.zoom.max(1e-6);
-        ((p.x - self.origin.x) / z, (p.y - self.origin.y) / z)
+        let unrotated = crate::viewturn::unplace(p, self.pivot, self.pan, self.rotation);
+        ((unrotated.x - self.origin.x) / z, (unrotated.y - self.origin.y) / z)
     }
 }
 

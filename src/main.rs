@@ -81,6 +81,7 @@ mod sound;
 mod shape_hints;
 mod stage;
 mod stage_a11y;
+mod viewturn;
 mod swatches_panel;
 mod start;
 mod startup;

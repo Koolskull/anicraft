@@ -161,3 +161,141 @@ fn the_screenshot_states_draw() {
         assert_eq!(app.aids_dialogs.grid.is_some(), which == "editgrid");
     }
 }
+
+/// Shift+Space drag turns the view about the canvas centre. Space alone pans. Shift+R stands
+/// it up. Neither changes the zoom, the stage point under the centre, or the document (ADR 0098).
+#[test]
+fn shift_space_turns_the_canvas_and_shift_r_stands_it_up() {
+    let (ctx, mut app) = app();
+    app.tool = Tool::Brush;
+    for _ in 0..3 {
+        frame(&ctx, &mut app, vec![]);
+    }
+    app.view.fit = false;
+    app.view.zoom = 2.0;
+    app.view.pan = vec2(40.0, -25.0);
+    app.view.rotation = 0.0;
+    frame(&ctx, &mut app, vec![]);
+    assert!(app.drop.stage.is_some(), "the stage drew");
+    let center = app.drop.stage.map(|g| g.canvas.center()).unwrap_or(pos2(800.0, 400.0));
+    let steps = app.s.history().undo_len();
+    let zoom = app.view.zoom;
+    let held = app.view_center_stage();
+    let mods = Modifiers::SHIFT;
+    let changed = || Event::ModifiersChanged(mods);
+    let space = || Event::Key { key: egui::Key::Space, physical_key: None, pressed: true, repeat: false, modifiers: mods };
+    let click = |p: Pos2, pressed: bool| Event::PointerButton { pos: p, button: PointerButton::Primary, pressed, modifiers: mods };
+
+    // Space alone pans. It does not turn the paper and it does not paint.
+    let none = Modifiers::NONE;
+    let space_only = |pressed: bool| Event::Key { key: egui::Key::Space, physical_key: None, pressed, repeat: false, modifiers: none };
+    let click_none = |p: Pos2, pressed: bool| Event::PointerButton { pos: p, button: PointerButton::Primary, pressed, modifiers: none };
+    let aside = center + vec2(36.0, 0.0);
+    frame(&ctx, &mut app, vec![Event::ModifiersChanged(none), space_only(true), Event::PointerMoved(center)]);
+    frame(&ctx, &mut app, vec![Event::ModifiersChanged(none), space_only(true), click_none(center, true)]);
+    frame(&ctx, &mut app, vec![Event::ModifiersChanged(none), space_only(true), Event::PointerMoved(aside)]);
+    frame(&ctx, &mut app, vec![Event::ModifiersChanged(none), space_only(true), click_none(aside, false)]);
+    frame(&ctx, &mut app, vec![Event::ModifiersChanged(none), space_only(false)]);
+    assert_eq!(app.view.rotation, 0.0, "space alone does not turn");
+    assert_eq!(app.s.history().undo_len(), steps, "space alone does not paint");
+    assert!((app.view.pan - vec2(40.0, -25.0)).length() > 1.0, "space alone pans");
+    app.view.pan = vec2(40.0, -25.0);
+    app.view.zoom = zoom;
+    app.drag = Drag::None;
+
+    // A tap with the chord does not paint a dab.
+    frame(&ctx, &mut app, vec![changed(), space(), Event::PointerMoved(center)]);
+    frame(&ctx, &mut app, vec![changed(), space(), click(center, true)]);
+    frame(&ctx, &mut app, vec![changed(), space(), click(center, false)]);
+    assert_eq!(app.s.history().undo_len(), steps, "a chord tap does not paint");
+    assert_eq!(app.view.rotation, 0.0);
+    assert_eq!(app.tool, Tool::Brush);
+
+    let a = center + vec2(80.0, 10.0);
+    let b = center + vec2(10.0, 80.0);
+    frame(&ctx, &mut app, vec![changed(), space(), Event::PointerMoved(a)]);
+    frame(&ctx, &mut app, vec![changed(), space(), click(a, true)]);
+    for k in 1..=6 {
+        let t = k as f32 / 6.0;
+        frame(&ctx, &mut app, vec![changed(), space(), Event::PointerMoved(a + (b - a) * t)]);
+    }
+    frame(&ctx, &mut app, vec![changed(), space(), Event::PointerMoved(b)]);
+    frame(&ctx, &mut app, vec![changed(), space(), click(b, false)]);
+    assert!(app.view.rotation.abs() > 20.0, "turned {}", app.view.rotation);
+    let now = app.view_center_stage();
+    assert!((now - held).length() < 1e-2, "centre jumped {held:?} -> {now:?}");
+    assert_eq!(app.view.zoom, zoom);
+    assert_eq!(app.s.history().undo_len(), steps, "turning is not a document edit");
+    assert_eq!(app.tool, Tool::Brush);
+    assert_eq!(app.drag, Drag::None);
+
+    frame(
+        &ctx,
+        &mut app,
+        vec![Event::ModifiersChanged(Modifiers::SHIFT), Event::Key { key: egui::Key::R, physical_key: None, pressed: true, repeat: false, modifiers: Modifiers::SHIFT }],
+    );
+    assert_eq!(app.view.rotation, 0.0, "Shift+R stands the view up");
+    let up = app.view_center_stage();
+    assert!((up - held).length() < 1e-2, "reset jumped {held:?} -> {up:?}");
+    assert_eq!(app.view.zoom, zoom);
+    assert_eq!(app.tool, Tool::Brush, "Shift+R is not the Rectangle tool");
+
+    frame(
+        &ctx,
+        &mut app,
+        vec![Event::ModifiersChanged(Modifiers::NONE), Event::Key { key: egui::Key::R, physical_key: None, pressed: true, repeat: false, modifiers: Modifiers::NONE }],
+    );
+    assert_eq!(app.tool, Tool::Rect, "a plain R still picks the Rectangle");
+}
+
+/// Command+Shift drag zooms about the canvas centre. Up zooms in. The stage point under the
+/// centre stays, and the chord does not paint (ADR 0098).
+#[test]
+fn command_shift_drag_zooms_about_the_middle() {
+    let (ctx, mut app) = app();
+    app.tool = Tool::Brush;
+    for _ in 0..3 {
+        frame(&ctx, &mut app, vec![]);
+    }
+    app.view.fit = false;
+    app.view.zoom = 2.0;
+    app.view.pan = vec2(40.0, -25.0);
+    app.view.rotation = 0.0;
+    frame(&ctx, &mut app, vec![]);
+    assert!(app.drop.stage.is_some(), "the stage drew");
+    let center = app.drop.stage.map(|g| g.canvas.center()).unwrap_or(pos2(800.0, 400.0));
+    let steps = app.s.history().undo_len();
+    let held = app.view_center_stage();
+    let mods = Modifiers::COMMAND | Modifiers::SHIFT;
+    let changed = || Event::ModifiersChanged(mods);
+    let click = |p: Pos2, pressed: bool| Event::PointerButton { pos: p, button: PointerButton::Primary, pressed, modifiers: mods };
+
+    frame(&ctx, &mut app, vec![changed(), Event::PointerMoved(center)]);
+    frame(&ctx, &mut app, vec![changed(), click(center, true)]);
+    frame(&ctx, &mut app, vec![changed(), click(center, false)]);
+    assert_eq!(app.s.history().undo_len(), steps, "a chord tap does not paint");
+    assert_eq!(app.view.zoom, 2.0);
+    assert_eq!(app.view.rotation, 0.0);
+    assert_eq!(app.tool, Tool::Brush);
+
+    let down = center + vec2(0.0, 40.0);
+    let up = down + vec2(0.0, -100.0);
+    frame(&ctx, &mut app, vec![changed(), Event::PointerMoved(down)]);
+    frame(&ctx, &mut app, vec![changed(), click(down, true)]);
+    frame(&ctx, &mut app, vec![changed(), Event::PointerMoved(up)]);
+    frame(&ctx, &mut app, vec![changed(), Event::PointerMoved(up)]);
+    let want = 2.0 * crate::viewturn::zoom_drag_factor(-100.0);
+    assert!((app.view.zoom - want).abs() < 1e-3, "zoom {} wanted {want}", app.view.zoom);
+    let now = app.view_center_stage();
+    assert!((now - held).length() < 1e-2, "centre jumped {held:?} -> {now:?}");
+    assert_eq!(app.view.rotation, 0.0);
+    assert_eq!(app.s.history().undo_len(), steps, "zooming is not a document edit");
+    assert_eq!(app.tool, Tool::Brush);
+
+    frame(&ctx, &mut app, vec![changed(), Event::PointerMoved(down)]);
+    frame(&ctx, &mut app, vec![changed(), Event::PointerMoved(down)]);
+    assert!((app.view.zoom - 2.0).abs() < 1e-3, "dragging back to the press restores the zoom, got {}", app.view.zoom);
+    frame(&ctx, &mut app, vec![changed(), click(down, false)]);
+    assert_eq!(app.drag, Drag::None);
+    assert_eq!(app.tool, Tool::Brush);
+}

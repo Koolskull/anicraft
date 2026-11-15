@@ -165,6 +165,16 @@ lets you change them (see [Preferences, shortcuts and accessibility](preferences
 | Fit the whole stage in the window | **View › Fit in Window** (**Ctrl+0**, or **Ctrl+2**) |
 | See the stage at actual size | **View › 100%** (**Ctrl+1**) |
 | Jump to a set zoom | the zoom menu at the right of the edit bar: Fit in window, 25 % to 800 % |
+| Zoom smoothly about the middle of the view | **Ctrl+Shift** and drag. Up zooms in, down zooms out |
+
+### Turning the canvas
+
+Hold **Shift+Space** and drag to turn the paper about the middle of the view, so a long stroke sits
+more comfortably under the wrist. Space alone still pans. **Shift+R**, or **View › Reset Rotation**,
+stands it upright again. The zoom stays where it was, and the point under the middle of the view
+stays put. The turn is the view only: the drawing in the file is still upright, and the rulers stay
+along the window. **Ctrl+Shift** and a drag zooms that same middle: up brings the drawing closer,
+down sends it back.
 
 ### The pasteboard
 

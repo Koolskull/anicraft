@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+* **Turn the canvas** (ADR 0098). Hold **Shift+Space** and drag to turn the view about the middle of the window. Space alone still pans. **Shift+R**, or **View › Reset Rotation**, stands it upright without changing the zoom. Hold **Ctrl+Shift** and drag to zoom smoothly about that same middle: up zooms in, down zooms out. The drawing in the file stays upright. Rulers stay on the window edges.
 * **Sound output polish** (ADR 0095, M5).
   * The playhead follows the sound being **heard**: the device's latency is taken off and slow
     frames are dropped rather than drifting (within a frame over an hour of play in tests).

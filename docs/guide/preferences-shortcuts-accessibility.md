@@ -131,7 +131,7 @@ lists them as **fixed** and won't assign them to anything else:
 | **Ctrl+Q** | quitting |
 | **Enter** | play and stop |
 | **Esc** | cancelling |
-| **Space** | panning with any tool (hold it and drag) |
+| **Space** | panning with any tool (hold it and drag). **Shift+Space** and a drag turns the canvas |
 | **Tab** | moving between fields |
 
 ## The command palette

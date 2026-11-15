@@ -121,6 +121,10 @@ frame, and **Shift+PageUp** and **Shift+PageDown** for the previous and next sce
 * **Ctrl+J** (Document Settings): it is **Modify › Document Settings**, with no key by default.
 * Panel toggles such as **Ctrl+L** for the Library have no key yet; use the **Window** menu.
 * **Ctrl+0** fits the stage in the window and **Ctrl+1** shows it at 100 %.
+* **Shift+Space** and a drag turns the canvas, the paper under the drawing. Space alone still
+  pans. **Shift+R** stands it back up without changing the zoom. Animate has no view turn.
+* **Ctrl+Shift** and a drag zooms smoothly about the middle of the view. Up zooms in, down zooms
+  out, and the point under that middle stays put.
 
 Any key can be changed in **Help › Keyboard Shortcuts** (**F1**), so you can bring back a habit
 of your own. See [Preferences, shortcuts, accessibility and languages](preferences-shortcuts-accessibility.md)
