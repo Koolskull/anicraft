@@ -357,6 +357,7 @@ dependencies = [
 name = "anicraft-guide"
 version = "0.3.0"
 dependencies = [
+ "craft-html",
  "pulldown-cmark",
 ]
 
@@ -388,6 +389,7 @@ dependencies = [
  "anicraft-doc",
  "anicraft-geom",
  "boa_engine",
+ "craft-html",
  "craft-image-codecs 0.1.0 (git+https://github.com/storytold/craft-libs?rev=f0f4758c01581d79577b9bf5046c06f4e77b1f18)",
  "rayon",
  "serde_json",
@@ -1246,6 +1248,11 @@ source = "git+https://github.com/storytold/craft-libs?rev=f0f4758c01581d79577b9b
 dependencies = [
  "gif",
 ]
+
+[[package]]
+name = "craft-html"
+version = "0.1.0"
+source = "git+https://github.com/storytold/craft-libs?rev=f0f4758c01581d79577b9bf5046c06f4e77b1f18#f0f4758c01581d79577b9bf5046c06f4e77b1f18"
 
 [[package]]
 name = "craft-image-codecs"
