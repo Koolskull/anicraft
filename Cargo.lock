@@ -240,6 +240,7 @@ dependencies = [
  "anicraft-gpu",
  "anicraft-guide",
  "anicraft-pen-macos",
+ "anicraft-raster",
  "anicraft-render",
  "cpal",
  "craft-update",
@@ -309,6 +310,7 @@ dependencies = [
  "anicraft-doc",
  "anicraft-geom",
  "anicraft-plugins",
+ "anicraft-raster",
  "anicraft-render",
  "anicraft-svg",
  "anicraft-text",
@@ -381,6 +383,10 @@ dependencies = [
  "wasmi",
  "wat",
 ]
+
+[[package]]
+name = "anicraft-raster"
+version = "0.3.0"
 
 [[package]]
 name = "anicraft-render"

@@ -17,15 +17,16 @@ pub fn specs() -> Vec<CommandSpec> {
         c("draw.object_drawing", "Object Drawing", "", Some("J"), "{on?: bool} (default: toggle)", false, object_drawing),
         c("draw.snap_to_objects", "Snap to Objects", "View/Snapping", Some("Ctrl+Shift+/"), "{on?: bool} (default: toggle) dragged points and selections, and the points the Line, Rectangle, Oval, PolyStar and Pen tools draw, snap to points, lines and fill edges (while it is off, the `snap` params of element.translate, raw.move_point and draw.snap only snap to guides, the grid and pixels, as View › Guides, Grid and Snapping say)", false, snap_to_objects),
         c("edit.select_all", "Select All", "Edit", Some("Ctrl+A"), "{}", false, select_all),
-        c("edit.deselect", "Deselect All", "Edit", Some("Ctrl+Shift+A"), "{}", false, |s, _| {
+        c("edit.deselect", "Deselect All", "Edit", Some("Ctrl+Shift+A"), "{} lets go of elements and of a raster crop", false, |s, _| {
             s.selection.clear();
+            crate::raster_crop::clear_pick(s);
             Ok(json!({"selected": 0}))
         }),
-        c("edit.delete", "Clear", "Edit", Some("Delete"), "{} (on every layer with selected items)", true, delete_selection),
-        c("edit.duplicate", "Duplicate", "Edit", Some("Ctrl+D"), "{dx?, dy?} (each copy on its original's layer)", true, |s, p| s.each_layer(true, |s| duplicate(s, p))),
+        c("edit.delete", "Clear", "Edit", Some("Delete"), "{} (on every layer with selected items; a raster crop is cleared too)", true, delete_selection),
+        c("edit.duplicate", "Duplicate", "Edit", Some("Ctrl+D"), "{dx?, dy?} (each copy on its original's layer; a raster crop is copied too and the original stays)", true, duplicate_all),
         c("element.select", "Select Elements", "", None, "{ids: [..], add?: bool, toggle?: bool, layer?} selects elements on any visible, unlocked layer at the playhead (ids are unique; `layer` looks only there); `toggle` takes each one that is selected out of the selection and adds the others (Shift+Space on a stage element); the active layer becomes the first one's unless it has some of them", false, select),
-        c("element.pick", "Select at Point", "", None, "{x, y, add?: bool, view?: stage|camera} the topmost element there on a visible, unlocked layer; `add` (Shift) adds it to the selection, or lets go of it, on any layer; with `view: camera` the point is on the movie's picture as the camera shows it (each layer through its depth)", false, pick),
-        c("element.translate", "Move", "", None, "{dx, dy, snap?, from?: [x, y]} moves the selection, on every layer; with `snap` (a distance) one of its corners or ends, or its box's corners or centre (the nearest to `from`), then snaps within that distance by the snap engine's priority (ADR 0076): a point, guide, line or fill edge of the rest, the grid, a whole pixel", true, translate),
+        c("element.pick", "Select at Point", "", None, "{x, y, add?: bool, view?: stage|camera} the topmost element there on a visible, unlocked layer; `add` (Shift) adds it to the selection, or lets go of it, on any layer; with `view: camera` the point is on the movie's picture as the camera shows it (each layer through its depth) An opaque pixel on a raster layer selects that plate's crop, tight around the ink, leaving out the clear margin.", false, pick),
+        c("element.translate", "Move", "", None, "{dx, dy, snap?, from?: [x, y]} moves the selection, on every layer; with `snap` (a distance) one of its corners or ends, or its box's corners or centre (the nearest to `from`), then snaps within that distance by the snap engine's priority (ADR 0076): a point, guide, line or fill edge of the rest, the grid, a whole pixel A raster crop moves with it.", true, translate),
         c("element.set_transform", "Transform", "", None, "{x?, y?, sx?, sy?, rotation? (degrees)}", true, |s, p| s.each_layer(true, |s| set_transform(s, p))),
         c("element.set_fill", "Fill Colour", "", None, "{color: \"#rrggbb\" | \"#rrggbbaa\" | null} (the alpha is the fill's own; 00 is a clear fill, not the same as null)", true, |s, p| s.each_layer(false, |s| set_fill(s, p))),
         c("element.set_stroke", "Stroke", "", None, "{color?: \"#rrggbb\" | \"#rrggbbaa\" | null, width?, profile?: uniform|taper_both|taper_start|taper_end|bulge|pinch | [[t, left, right], ..], cap?, join?, miter?, style?, dash?, dash_offset?, dot_spacing? (as stroke.set_style)}", true, |s, p| s.each_layer(false, |s| set_stroke(s, p))),
@@ -49,7 +50,7 @@ pub fn specs() -> Vec<CommandSpec> {
         c("arrange.bring_forward", "Bring Forward", "Modify/Arrange", Some("Ctrl+Up"), "{} (within each layer)", true, |s, _| s.each_layer(true, |s| arrange_step(s, true))),
         c("arrange.send_backward", "Send Backward", "Modify/Arrange", Some("Ctrl+Down"), "{} (within each layer)", true, |s, _| s.each_layer(true, |s| arrange_step(s, false))),
         c("arrange.send_to_back", "Send to Back", "Modify/Arrange", Some("Ctrl+Shift+Down"), "{} (within each layer)", true, |s, _| s.each_layer(true, |s| arrange(s, false))),
-        c("modify.convert_to_symbol", "Convert to Symbol…", "Modify", Some("F8"), "{name? (default: the next free “Symbol n”; a name the folder holds gets a number), kind?: graphic|movie_clip|button (default: graphic), folder?: Library folder id (default: the top level)} → {symbol, instance, name, layer, folder} (a selection on several layers becomes one symbol with those layers inside; the instance lands on the topmost)", true, convert_to_symbol),
+        c("modify.convert_to_symbol", "Convert to Symbol…", "Modify", Some("F8"), "{name? (default: the next free “Symbol n”; a name the folder holds gets a number), kind?: graphic|movie_clip|button (default: graphic), folder?: Library folder id (default: the top level)} → {symbol, instance, name, layer, folder} (a selection on several layers becomes one symbol with those layers inside; the instance lands on the topmost) A raster crop becomes a bitmap inside the symbol and leaves a hole on the plate; the instance is a new layer above that plate.", true, convert_to_symbol),
         c("modify.break_apart", "Break Apart", "Modify", Some("Ctrl+B"), "{} the selected symbol instances become their contents, text becomes shapes, and drawing objects become raw shapes that merge with the raw shapes they touch", true, |s, p| s.each_layer(false, |s| break_apart(s, p))),
         c("library.place", "Place on Stage", "", None, "{symbol | bitmap | sound: id, x?, y?} or {items: [{symbol | bitmap | sound: id}, ..], x?, y?} → {element, elements, sound?}: symbols and bitmaps centred on x, y (default: the stage centre; inside an open symbol, in its space) in the active layer's keyframe at the playhead, selected; a sound goes onto that keyframe, its span grown to fit (one sound per keyframe). One undo step", true, place),
     ]
@@ -265,6 +266,7 @@ fn select(s: &mut Session, p: &Value) -> Result<Value> {
     } else {
         if !add {
             s.selection.clear();
+            crate::raster_crop::clear_pick(s);
         }
         for &(l, id) in &picked {
             s.selection.insert(l, id);
@@ -288,29 +290,60 @@ fn pick(s: &mut Session, p: &Value) -> Result<Value> {
         Some("camera") => true,
         Some(v) => return Err(EngineError::Param(format!("unknown view '{v}' (stage or camera)"))),
     };
-    match if through { s.hit_test_camera(pt, 2.0) } else { s.hit_test(pt, 2.0) } {
-        Some((layer, el)) => {
-            // Shift adds it to (or takes it from) the selection, whichever layers that is on.
-            if add {
-                s.selection.toggle(layer, el);
-            } else if !s.selection.contains(layer, el) {
-                s.selection = Selection::only(layer, [el]);
+    // Through the camera, plates stay out of the pick (ADR 0115). A miss still lets the crop go.
+    if through {
+        return match s.hit_test_camera(pt, 2.0) {
+            Some((layer, el)) => {
+                if !add {
+                    crate::raster_crop::clear_pick(s);
+                }
+                pick_element(s, layer, el, add)
             }
-            s.layer = layer;
-            Ok(json!({"layer": layer.0, "element": el.0}))
+            None => {
+                if !add {
+                    s.selection.clear();
+                    crate::raster_crop::clear_pick(s);
+                }
+                Ok(json!({"element": null}))
+            }
+        };
+    }
+    match s.stage_hit(pt) {
+        Some(crate::StageHit::Raster(layer)) => Ok(crate::raster_crop::click(s, layer, pt, add)),
+        Some(crate::StageHit::Element(layer, el)) => {
+            if !add {
+                crate::raster_crop::clear_pick(s);
+            }
+            pick_element(s, layer, el, add)
         }
         None => {
             if !add {
                 s.selection.clear();
+                crate::raster_crop::clear_pick(s);
             }
             Ok(json!({"element": null}))
         }
     }
 }
 
+/// Shift adds `el` or lets go of it. A plain click selects it when it was not already.
+fn pick_element(s: &mut Session, layer: anicraft_doc::LayerId, el: ElementId, add: bool) -> Result<Value> {
+    if add {
+        s.selection.toggle(layer, el);
+    } else if !s.selection.contains(layer, el) {
+        s.selection = Selection::only(layer, [el]);
+    }
+    s.layer = layer;
+    Ok(json!({"layer": layer.0, "element": el.0}))
+}
+
 // ----- element edits ----------------------------------------------------------------------
 
 fn translate(s: &mut Session, p: &Value) -> Result<Value> {
+    let pixels = s.raster_pick().is_some();
+    if s.selection.is_empty() && !pixels {
+        return Err(EngineError::State("nothing is selected".into()));
+    }
     let (mut dx, mut dy) = (f32_req(p, "dx")?, f32_req(p, "dy")?);
     let snap = opt_f32(p, "snap")?.unwrap_or(0.0).clamp(0.0, 1000.0);
     let from = match p.get("from").filter(|v| !v.is_null()) {
@@ -320,15 +353,23 @@ fn translate(s: &mut Session, p: &Value) -> Result<Value> {
             Some(xy.filter(|q| q.is_finite()).ok_or_else(|| EngineError::Param("param 'from' must be [x, y]".into()))?)
         }
     };
-    let n = move_by(s, Vec2::new(dx, dy))?;
-    // Snapping while dragging (ADR 0041): a little more, onto what is near.
+    let mut n = 0u64;
     let mut snapped = Value::Null;
-    if s.snaps(snap)
-        && let Some((extra, at, kind)) = crate::cmds_raw::snap_selection(s, snap, from)
-    {
-        move_by(s, extra)?;
-        (dx, dy) = (dx + extra.x, dy + extra.y);
-        snapped = json!({"x": at.x, "y": at.y, "to": kind.key()});
+    // A crop on its own skips snapping: there is no element corner to aim (ADR 0115).
+    if !s.selection.is_empty() {
+        n = move_by(s, Vec2::new(dx, dy))?;
+        // Snapping while dragging (ADR 0041): a little more, onto what is near.
+        if s.snaps(snap)
+            && let Some((extra, at, kind)) = crate::cmds_raw::snap_selection(s, snap, from)
+        {
+            move_by(s, extra)?;
+            (dx, dy) = (dx + extra.x, dy + extra.y);
+            snapped = json!({"x": at.x, "y": at.y, "to": kind.key()});
+        }
+    }
+    // The crop takes that final step once, including the snap the elements took.
+    if pixels {
+        crate::raster_crop::nudge(s, dx, dy)?;
     }
     Ok(json!({"moved": n, "dx": dx, "dy": dy, "snapped": snapped}))
 }
@@ -718,9 +759,17 @@ fn rename(s: &mut Session, p: &Value) -> Result<Value> {
     Ok(json!({"name": name}))
 }
 
-/// Clear: the selection goes, on every layer it is on.
+/// Clear: the selection goes, on every layer it is on. A raster crop is cleared too.
 pub(crate) fn delete_selection(s: &mut Session, p: &Value) -> Result<Value> {
-    s.each_layer(true, |s| delete(s, p))
+    let pixels = crate::raster_crop::delete_pick(s)?;
+    if s.selection.is_empty() {
+        return if pixels { Ok(json!({"deleted": 0, "pixels": true})) } else { Err(EngineError::State("nothing is selected".into())) };
+    }
+    let mut v = s.each_layer(true, |s| delete(s, p))?;
+    if pixels && let Some(obj) = v.as_object_mut() {
+        obj.insert("pixels".into(), json!(true));
+    }
+    Ok(v)
 }
 
 fn delete(s: &mut Session, _: &Value) -> Result<Value> {
@@ -728,12 +777,38 @@ fn delete(s: &mut Session, _: &Value) -> Result<Value> {
     if sel.is_empty() {
         return Err(EngineError::State("nothing is selected".into()));
     }
-    let kf = s.editable_keyframe()?;
+    let kf = s.editable_keyframe_in(crate::KeyEdit::Placed)?;
     let before = kf.elements.len();
     kf.elements.retain(|e| !sel.contains(&e.id));
     let n = before - kf.elements.len();
     s.selection.clear();
     Ok(json!({"deleted": n}))
+}
+
+/// Elements first, then the crop. `select_only` inside the element copy drops the crop, so
+/// it is put back before the pixels are copied.
+fn duplicate_all(s: &mut Session, p: &Value) -> Result<Value> {
+    let dx = opt_f32(p, "dx")?.unwrap_or(10.0);
+    let dy = opt_f32(p, "dy")?.unwrap_or(10.0);
+    let had_pixels = s.raster_pick().is_some();
+    if s.selection.is_empty() && !had_pixels {
+        return Err(EngineError::State("nothing is selected".into()));
+    }
+    let mut v = if s.selection.is_empty() {
+        json!({})
+    } else {
+        let saved = s.raster_pick;
+        let v = s.each_layer(true, |s| duplicate(s, p))?;
+        s.raster_pick = saved;
+        v
+    };
+    if had_pixels {
+        crate::raster_crop::duplicate(s, dx, dy)?;
+        if let Some(obj) = v.as_object_mut() {
+            obj.insert("pixels".into(), json!(true));
+        }
+    }
+    Ok(v)
 }
 
 fn duplicate(s: &mut Session, p: &Value) -> Result<Value> {
@@ -743,7 +818,7 @@ fn duplicate(s: &mut Session, p: &Value) -> Result<Value> {
     if sel.is_empty() {
         return Err(EngineError::State("nothing is selected".into()));
     }
-    let copies: Vec<Element> = s.editable_keyframe()?.elements.iter().filter(|e| sel.contains(&e.id)).map(|e| (**e).clone()).collect();
+    let copies: Vec<Element> = s.editable_keyframe_in(crate::KeyEdit::Placed)?.elements.iter().filter(|e| sel.contains(&e.id)).map(|e| (**e).clone()).collect();
     let mut new_ids = Vec::new();
     let mut out = Vec::new();
     for mut e in copies {
@@ -752,7 +827,7 @@ fn duplicate(s: &mut Session, p: &Value) -> Result<Value> {
         new_ids.push(e.id);
         out.push(Arc::new(e));
     }
-    s.editable_keyframe()?.elements.extend(out);
+    s.editable_keyframe_in(crate::KeyEdit::Placed)?.elements.extend(out);
     s.select_only(new_ids.iter().copied());
     Ok(json!({"created": new_ids.iter().map(|e| e.0).collect::<Vec<_>>()}))
 }
@@ -803,9 +878,10 @@ fn arrange_step(s: &mut Session, forward: bool) -> Result<Value> {
 /// selected element was; the other layers lose what was selected (ADR 0044).
 pub(crate) fn convert_to_symbol(s: &mut Session, p: &Value) -> Result<Value> {
     let layers = s.selected_layers();
-    let Some(&top) = layers.first() else {
+    let raster = raster_home(s);
+    if layers.is_empty() && raster.is_none() {
         return Err(EngineError::State("select something to convert".into()));
-    };
+    }
     // Into the folder asked for (ADR 0053), else the top level; the name is free there: the
     // next free “Symbol n”, or the name asked for with a number when the folder has it already.
     let folder = crate::cmds_library::opt_folder(s, p, "folder")?;
@@ -828,13 +904,22 @@ pub(crate) fn convert_to_symbol(s: &mut Session, p: &Value) -> Result<Value> {
     };
     // Children are stored relative to the registration point (the selection centre).
     let to_local = Affine::translate(-center.x, -center.y);
+    // The crop is cut out before the element loop, which would otherwise see a raster layer
+    // refuse the edit. The picture stays where it was: the shape is recentered with the rest.
+    let shape = if raster.is_some() { crate::raster_crop::take_shape(s, &name, folder)? } else { None };
+    if layers.is_empty() {
+        return convert_raster_only(s, shape, raster, (sym_id, first_layer, inst_id, instance, to_local), folder, kind, name);
+    }
+    let Some(&top) = layers.first() else {
+        return Err(EngineError::State("select something to convert".into()));
+    };
     let single = layers.len() == 1;
     let mut inner: Vec<Arc<Layer>> = Vec::with_capacity(layers.len());
     for l in layers {
         let sel = s.selection.on(l);
         let source = s.timeline().layer(l).map(|x| x.name.clone()).unwrap_or_default();
         let picked = s.with_layer(l, |s| -> Result<Vec<Arc<Element>>> {
-            let kf = s.editable_keyframe()?;
+            let kf = s.editable_keyframe_in(crate::KeyEdit::Placed)?;
             let first_pos = kf.elements.iter().position(|e| sel.contains(&e.id)).unwrap_or(kf.elements.len());
             let (picked, mut rest): (Vec<Arc<Element>>, Vec<Arc<Element>>) = kf.elements.drain(..).partition(|e| sel.contains(&e.id));
             if l == top {
@@ -858,6 +943,9 @@ pub(crate) fn convert_to_symbol(s: &mut Session, p: &Value) -> Result<Value> {
         }
         inner.push(Arc::new(layer));
     }
+    if let Some((element, _)) = shape {
+        inner.push(Arc::new(pixel_symbol_layer(s, element, &to_local)));
+    }
     s.doc.library.push(Arc::new(Symbol { id: sym_id, name: name.clone(), kind, linkage: None, scale_grid_kept: None, scale_grid: None, timeline: Timeline { layers: inner } }));
     if folder.is_some() {
         s.doc.place_entry(LibraryEntry::Item(LibraryItem::Symbol(sym_id)), folder);
@@ -865,6 +953,62 @@ pub(crate) fn convert_to_symbol(s: &mut Session, p: &Value) -> Result<Value> {
     s.layer = top;
     s.select_only([inst_id]);
     Ok(json!({"symbol": sym_id.0, "instance": inst_id.0, "name": name, "layer": top.0, "folder": folder.map(|f| f.0)}))
+}
+
+/// The crop's layer, its folder, and the key span the picture was on.
+fn raster_home(s: &Session) -> Option<(LayerId, Option<LayerId>, u32, u32)> {
+    let pick = s.raster_pick()?;
+    let layer = s.timeline().layer(pick.layer)?;
+    let key = layer.keyframes.iter().find(|k| k.start == pick.key)?;
+    Some((pick.layer, layer.parent, key.start, key.duration))
+}
+
+/// A symbol layer holding the crop, recentered like the other children. It sits at the
+/// bottom of the symbol so the vectors stay on top.
+fn pixel_symbol_layer(s: &mut Session, mut element: Element, to_local: &Affine) -> Layer {
+    element.transform = to_local.mul(&element.transform);
+    let mut layer = Layer::new(LayerId(s.doc.alloc_id()), "Pixels");
+    if let Some(k) = layer.keyframe_mut(0) {
+        k.elements = vec![Arc::new(element)];
+    }
+    layer
+}
+
+/// A crop and nothing else: the instance goes on a new vector layer just above the plate,
+/// covering the same frames, so leftover ink on the plate cannot hide it.
+fn convert_raster_only(s: &mut Session, shape: Option<(Element, anicraft_doc::BitmapId)>, raster: Option<(LayerId, Option<LayerId>, u32, u32)>, built: (SymbolId, LayerId, ElementId, Element, Affine), folder: Option<anicraft_doc::FolderId>, kind: SymbolKind, name: String) -> Result<Value> {
+    let (sym_id, first_layer, inst_id, instance, to_local) = built;
+    let Some((mut element, _)) = shape else {
+        return Err(EngineError::State("select something to convert".into()));
+    };
+    let Some((plate, parent, start, duration)) = raster else {
+        return Err(EngineError::State("the pixel crop is gone".into()));
+    };
+    element.transform = to_local.mul(&element.transform);
+    let mut inner = Layer::new(first_layer, "Layer 1");
+    if let Some(k) = inner.keyframe_mut(0) {
+        k.elements = vec![Arc::new(element)];
+    }
+    s.doc.library.push(Arc::new(Symbol { id: sym_id, name: name.clone(), kind, linkage: None, scale_grid_kept: None, scale_grid: None, timeline: Timeline { layers: vec![Arc::new(inner)] } }));
+    if folder.is_some() {
+        s.doc.place_entry(LibraryEntry::Item(LibraryItem::Symbol(sym_id)), folder);
+    }
+    let host_id = LayerId(s.doc.alloc_id());
+    let mut host = Layer::new(host_id, name.clone());
+    host.parent = parent;
+    if let Some(k) = host.keyframe_mut(0) {
+        k.start = start;
+        k.duration = duration.max(1);
+        k.elements = vec![Arc::new(instance)];
+    }
+    {
+        let tl = crate::editing::edited_mut(&mut s.doc, s.scene, &s.editing)?;
+        let at = tl.layers.iter().position(|l| l.id == plate).unwrap_or(0);
+        tl.layers.insert(at, Arc::new(host));
+    }
+    s.layer = host_id;
+    s.select_only([inst_id]);
+    Ok(json!({"symbol": sym_id.0, "instance": inst_id.0, "name": name, "layer": host_id.0, "folder": folder.map(|f| f.0)}))
 }
 
 fn break_apart(s: &mut Session, _: &Value) -> Result<Value> {

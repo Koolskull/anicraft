@@ -37,6 +37,7 @@ fn tool_icon(tool: Tool) -> Icon {
         Tool::Warp => Icon::Warp,
         Tool::Hand => Icon::Hand,
         Tool::Zoom => Icon::Zoom,
+        Tool::Pixel => Icon::Image,
     }
 }
 
@@ -515,7 +516,14 @@ pub(crate) fn colour_panel(app: &mut App, ui: &mut egui::Ui) {
     app.colour_target = target;
     crate::swatches_panel::target_toggle(app, ui);
     if !(stroke_changed || fill_changed) {
-        ui.label(text(Type::Caption, if app.s.selection.is_empty() { tr!("New shapes and text use these colours.") } else { tr!("Changes apply to the selection and to new drawing.") }));
+        let caption = if app.tool == Tool::Pixel {
+            tr!("The Raster brush paints with this fill. Its alpha is the opacity of the whole stroke.")
+        } else if app.s.selection.is_empty() {
+            tr!("New shapes and text use these colours.")
+        } else {
+            tr!("Changes apply to the selection and to new drawing.")
+        };
+        ui.label(text(Type::Caption, caption));
         return;
     }
     if stroke_changed {
@@ -612,7 +620,7 @@ pub(crate) fn properties(app: &mut App, ui: &mut egui::Ui) {
     let sel: Vec<_> = app.s.selected_elements().into_iter().map(|(_, e)| e).collect();
 
     // ---- tool options first while a drawing tool is in hand: they're what you reach for ----
-    if matches!(app.tool, Tool::Rect | Tool::Oval | Tool::Star | Tool::Line | Tool::Pen | Tool::Text | Tool::Pencil | Tool::Brush | Tool::PaintBrush | Tool::Eraser | Tool::PaintBucket | Tool::InkBottle | Tool::Eyedropper) {
+    if matches!(app.tool, Tool::Rect | Tool::Oval | Tool::Star | Tool::Line | Tool::Pen | Tool::Text | Tool::Pencil | Tool::Brush | Tool::PaintBrush | Tool::Eraser | Tool::PaintBucket | Tool::InkBottle | Tool::Eyedropper | Tool::Pixel) {
         let title = tr!("{tool} tool", tool = crate::i18n::t(app.tool.label()));
         section(ui, "prop_tool", Section::Rule, &title, None, |ui| tool_props(app, ui));
     }
@@ -659,6 +667,14 @@ pub(crate) fn properties(app: &mut App, ui: &mut egui::Ui) {
             (n, l) => trn!("{n} element {on_layers}", "{n} elements {on_layers}", n, on_layers = trn!("on {n} layer", "on {n} layers", l)),
         };
         section(ui, "prop_selection", Section::Rule, &title, None, |ui| selection_props(app, ui, e, &sel));
+    } else if let Some((w, h)) = app.s.raster_pick().map(|p| (p.rect.w, p.rect.h)) {
+        // Copied out before the section borrows the app to run Convert.
+        section(ui, "prop_pixels", Section::Rule, tr!("Pixel crop"), None, |ui| {
+            ui.label(text(Type::Caption, tr!("{w} × {h}. Drag to move it. Convert to Symbol makes a movie clip.", w = w, h = h)));
+            if ui.button(tr!("Convert to Symbol")).clicked() {
+                app.invoke("modify.convert_to_symbol");
+            }
+        });
     } else if let Some((id, name)) = app.s.editing_symbol().and_then(|id| app.s.doc.symbol(id).map(|x| (id, x.name.clone()))) {
         // Inside a symbol, nothing selected: the symbol's own settings (ADR 0055).
         section(ui, "prop_symbol", Section::Rule, &tr!("Symbol: {name}", name = name), None, |ui| scale_grid_props(app, ui, id, "open"));
@@ -2542,6 +2558,10 @@ pub(crate) fn stroke_only(tool: Tool) -> bool {
 }
 
 fn tool_props(app: &mut App, ui: &mut egui::Ui) {
+    if app.tool == Tool::Pixel {
+        pixel_props(app, ui);
+        return;
+    }
     if app.tool == Tool::Eraser {
         eraser_props(app, ui);
         return;
@@ -2679,6 +2699,167 @@ fn polystar_props(app: &mut App, ui: &mut egui::Ui) {
                 .set_name(tr!("Star point size"));
         });
     }
+}
+
+/// The Raster tool: stage pixels on a pixel layer, or a smudge of the colours already there.
+fn pixel_props(app: &mut App, ui: &mut egui::Ui) {
+    if ui.button(tr!("New Raster Layer")).on_hover_text(tr!("Adds a transparent pixel layer the size of the stage. The Raster tool also adds one on the first stroke.")).clicked() {
+        app.run("layer.new_raster", json!({}));
+    }
+    let bitmaps = crate::colour_panel::bitmaps(app);
+    let mut st = app.s.style.clone();
+    let mut set = None;
+    row(ui, tr!("Fill"), |ui| {
+        let paint = st.fill_paint();
+        let (r, edit) = crate::colour_panel::swatch(ui, Some(&paint), &bitmaps);
+        r.named(tr!("Fill colour")).on_hover_text(tr!("The colour the pixel brush paints, the same fill as the vector brush. Its alpha is the opacity of the whole stroke."));
+        match edit {
+            Some(crate::colour_panel::FillEdit::Solid(p)) => {
+                st.set_fill_color(Rgba::new(f32::from(p[0]) / 255.0, f32::from(p[1]) / 255.0, f32::from(p[2]) / 255.0, f32::from(p[3]) / 255.0));
+                st.use_fill = true;
+            }
+            Some(crate::colour_panel::FillEdit::None(_)) => {}
+            other => set = other,
+        }
+    });
+    if let Some(edit) = set {
+        app.s.style = st;
+        crate::colour_panel::apply_set(app, &edit, false);
+        st = app.s.style.clone();
+    }
+    app.s.style = st;
+    let keys = [app.keymap.primary("view.brush_smaller"), app.keymap.primary("view.brush_larger")].into_iter().flatten().map(crate::platform::shortcut_label).collect::<Vec<_>>().join(" / ");
+    row(ui, tr!("Size"), |ui| {
+        let r = ui.add(egui::DragValue::new(&mut app.pixel.size).suffix(" px").speed(1.0).range(crate::pixeltool::SIZE_MIN..=crate::pixeltool::SIZE_MAX).max_decimals(1)).named(tr!("Pixel brush size"));
+        if !keys.is_empty() {
+            r.on_hover_text(tr!("Pixel brush size ({keys})", keys = keys));
+        }
+    });
+    app.pixel.size_min = app.pixel.size_min.clamp(crate::pixeltool::THIN_MIN, app.pixel.size);
+    let thin_max = app.pixel.size;
+    row(ui, tr!("Thinnest"), |ui| {
+        ui.add(egui::DragValue::new(&mut app.pixel.size_min).suffix(" px").speed(0.01).range(crate::pixeltool::THIN_MIN..=thin_max).max_decimals(2))
+            .named(tr!("Pixel brush thinnest"))
+            .on_hover_text(tr!("The width of the lightest pen press. 0.05 is a hairline."));
+    });
+    row_prose(ui, tr!("Pressure"), |ui| {
+        crate::theme::checkbox(ui, &mut app.pixel.pressure_opacity, tr!("Opacity")).on_hover_text(tr!("Pen pressure sets the stroke's opacity, from Minimum to Maximum. Off: the fill colour's alpha is the opacity of the whole stroke."));
+    });
+    ui.add_enabled_ui(app.pixel.pressure_opacity, |ui| {
+        row(ui, tr!("Minimum"), |ui| {
+            let mut pct = app.pixel.opacity_min * 100.0;
+            let cap = app.pixel.opacity_max * 100.0;
+            if ui
+                .add(egui::DragValue::new(&mut pct).suffix(" %").speed(0.5).range(0.0..=cap).max_decimals(0))
+                .named(tr!("Minimum opacity"))
+                .on_hover_text(tr!("How clear a light press is, as a part of the fill colour's alpha. 0% is clear."))
+                .changed()
+            {
+                app.pixel.opacity_min = (pct / 100.0).clamp(0.0, app.pixel.opacity_max);
+            }
+        });
+        row(ui, tr!("Maximum"), |ui| {
+            let mut pct = app.pixel.opacity_max * 100.0;
+            let floor = app.pixel.opacity_min * 100.0;
+            if ui
+                .add(egui::DragValue::new(&mut pct).suffix(" %").speed(0.5).range(floor..=100.0).max_decimals(0))
+                .named(tr!("Maximum opacity"))
+                .on_hover_text(tr!("How opaque a full press is, as a part of the fill colour's alpha. 100% is the fill colour's alpha."))
+                .changed()
+            {
+                app.pixel.opacity_max = (pct / 100.0).clamp(app.pixel.opacity_min, 1.0);
+            }
+        });
+    });
+    row(ui, tr!("Flow"), |ui| {
+        let mut pct = app.pixel.flow * 100.0;
+        if ui
+            .add(egui::DragValue::new(&mut pct).suffix(" %").speed(0.5).range(0.0..=100.0).max_decimals(0))
+            .named(tr!("Raster flow"))
+            .on_hover_text(tr!("How much of the stroke one dab lays down. 100% keeps the strongest mark. Lower lets a pencil build up, still capped by the fill colour's alpha."))
+            .changed()
+        {
+            app.pixel.flow = (pct / 100.0).clamp(0.0, 1.0);
+        }
+    });
+    if app.pixel.picture != anicraft_raster::Picture::None && !app.pixel.smudge {
+        ui.label(text(Type::Caption, tr!("Each dab is this brush picture, turned.")).color(T.text_dim));
+    }
+    ui.add_enabled_ui(app.pixel.picture == anicraft_raster::Picture::None && !app.pixel.smudge, |ui| {
+        row(ui, tr!("Spray"), |ui| {
+            let mut pct = app.pixel.speckle * 100.0;
+            if ui
+                .add(egui::DragValue::new(&mut pct).suffix(" %").speed(0.5).range(0.0..=100.0).max_decimals(0))
+                .named(tr!("Raster spray"))
+                .on_hover_text(tr!("Tiny dots of mixed size and opacity inside the brush, like spray paint. 0% is a solid dab. A soft brush keeps more of them near the middle."))
+                .changed()
+            {
+                app.pixel.speckle = (pct / 100.0).clamp(0.0, 1.0);
+            }
+        });
+        row(ui, tr!("Grain"), |ui| {
+            let mut pct = app.pixel.grain * 100.0;
+            if ui
+                .add(egui::DragValue::new(&mut pct).suffix(" %").speed(0.5).range(0.0..=100.0).max_decimals(0))
+                .named(tr!("Raster grain"))
+                .on_hover_text(tr!("Paper tooth. The same grain stays on the page, so a second pass catches the same spots. It shows most where the mark is soft."))
+                .changed()
+            {
+                app.pixel.grain = (pct / 100.0).clamp(0.0, 1.0);
+            }
+        });
+        row(ui, tr!("Lay"), |ui| {
+            let mut pct = app.pixel.wedge * 100.0;
+            if ui
+                .add(egui::DragValue::new(&mut pct).suffix(" %").speed(0.5).range(0.0..=100.0).max_decimals(0))
+                .named(tr!("Raster pencil lay"))
+                .on_hover_text(tr!("How far the tip lies on its side. 0% is round. 100% is a wide pencil: a sharp edge, and a soft fade in the direction the stroke is going."))
+                .changed()
+            {
+                app.pixel.wedge = (pct / 100.0).clamp(0.0, 1.0);
+            }
+        });
+    });
+    row(ui, tr!("Softness"), |ui| {
+        let help = if app.pixel.smudge {
+            tr!("0 blends with a hard edge. 1 blends smoothly, pulling colour from further along the stroke.")
+        } else {
+            tr!("0 is a flat disc. 1 fades from the centre.")
+        };
+        ui.add(egui::DragValue::new(&mut app.pixel.softness).speed(0.01).range(0.0..=1.0).fixed_decimals(2)).named(tr!("Pixel brush softness")).on_hover_text(help);
+    });
+    row_prose(ui, tr!("Antialias"), |ui| {
+        let label = if app.pixel.fringe <= 0.0 {
+            tr!("Off")
+        } else if (app.pixel.fringe - 0.5).abs() < 0.01 {
+            tr!("0.5")
+        } else if (app.pixel.fringe - 1.0).abs() < 0.01 {
+            tr!("1")
+        } else {
+            tr!("2")
+        };
+        egui::ComboBox::from_id_salt("pixel_aa").width(crate::theme::fit(ui, 120.0)).selected_text(label).show_ui(ui, |ui| {
+            ui.selectable_value(&mut app.pixel.fringe, 0.0, tr!("Off"));
+            ui.selectable_value(&mut app.pixel.fringe, 0.5, tr!("0.5"));
+            ui.selectable_value(&mut app.pixel.fringe, 1.0, tr!("1"));
+            ui.selectable_value(&mut app.pixel.fringe, 2.0, tr!("2"));
+        })
+        .response
+        .set_name(tr!("Pixel brush antialias"));
+    });
+    row_prose(ui, tr!("Erase"), |ui| {
+        crate::theme::checkbox(ui, &mut app.pixel.erase, tr!("Erase")).on_hover_text(tr!("Punch out the paint instead of adding colour"));
+    });
+    row_prose(ui, tr!("Smudge"), |ui| {
+        crate::theme::checkbox(ui, &mut app.pixel.smudge, tr!("Smudge")).on_hover_text(tr!("Blend the colours already on the pixel layer. Stretch sets how dry that blend is. It does not add a new colour."));
+    });
+    ui.add_enabled_ui(app.pixel.smudge, |ui| {
+        row(ui, tr!("Stretch"), |ui| {
+            ui.add(egui::DragValue::new(&mut app.pixel.stretch).speed(0.01).range(0.0..=1.0).fixed_decimals(2))
+                .named(tr!("Paint stretch"))
+                .on_hover_text(tr!("How dry the paint is. 0 stays put. 1 is the strongest drag, and it still fades instead of carrying the colour the whole stroke."));
+        });
+    });
 }
 
 /// The Eraser's options (ADR 0034): the Faucet, size, shape and erase mode, as in Animate.

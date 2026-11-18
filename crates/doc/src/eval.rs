@@ -44,6 +44,9 @@ pub struct DisplayItem {
     /// Whether `image` is filtered between its pixels (the bitmap's Allow Smoothing, ADR 0050);
     /// off, each pixel is a hard-edged square.
     pub smooth: bool,
+    /// A pixel-layer plate (ADR 0113). Library bitmaps leave this empty. The GPU keeps one
+    /// texture per `stamp` and rewrites the dirty rows when `generation` moves.
+    pub plate: Option<crate::PlateDraw>,
     /// A warped bitmap fill (ADR 0079): the mesh, in the item's local space, that carries the
     /// image as drawn (`rest`) to where it shows (`shown`); renderers draw the image through
     /// its triangles. `None` for everything else (a warped shape's path is already bent).
@@ -561,6 +564,33 @@ fn eval_timeline(doc: &Document, tl: &Timeline, frame: u32, cx: &Ctx, out: &mut 
         for el in elements.iter() {
             eval_element(doc, cx, &lc, el, out, play);
         }
+        // A raster layer's plate is the stage, one texel per stage pixel, hard-edged (ADR 0112).
+        if layer.kind == LayerKind::Raster
+            && let Some(plate) = layer.keyframe_at(frame).and_then(|k| k.plate.as_ref())
+            && plate.is_ok()
+        {
+            let image = plate.image();
+            let (w, h) = (image.width as f32, image.height as f32);
+            out.items.push(DisplayItem {
+                path: Arc::new(Path::rect(0.0, 0.0, w, h)),
+                transform: layer_xf,
+                fill: Some(Paint::Bitmap { bitmap: crate::BitmapId(0), repeat: false, matrix: Affine::IDENTITY }),
+                stroke: None,
+                fill_rule: FillRule::NonZero,
+                color: cx.color,
+                layer: layer.id,
+                element: crate::ElementId(0),
+                outline: layer_outline,
+                clip,
+                masks,
+                guide,
+                group: cx.group,
+                image: Some(image),
+                smooth: false,
+                warp: None,
+                plate: Some(plate.draw()),
+            });
+        }
     }
 }
 
@@ -638,6 +668,7 @@ fn eval_element(doc: &Document, cx: &Ctx, lc: &LayerCtx<'_>, el: &Element, out: 
                     Some(Paint::Bitmap { .. }) if !is_sliced => s.live_warp().filter(|w| !w.at_rest()).and_then(crate::warp::Warp::mesh).map(Arc::new),
                     _ => None,
                 },
+                plate: None,
             });
         }
         ElementKind::Text(t) => {
@@ -658,6 +689,7 @@ fn eval_element(doc: &Document, cx: &Ctx, lc: &LayerCtx<'_>, el: &Element, out: 
                 image: None,
                 smooth: true,
                 warp: None,
+                plate: None,
             };
             match &t.field {
                 // Mask artwork: a field's text masks; its box and border don't.

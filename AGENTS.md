@@ -16,6 +16,7 @@ crates/guide    L0  The user guide (docs/guide) as a bundled static HTML book, w
 crates/pen-macos L0  macOS pen pressure: AppKit tablet points for the brush (ADR 0096)
 crates/doc      L1  Document model, easing, timeline evaluation, the interactive player, sample scene
 crates/text     L1  Fonts on this computer, shaping and line layout into outlines (ADR 0012)
+crates/raster   L1  Cropped RGBA cels: round pixel dabs, stroke spacing, smudge, clip-to-alpha
 crates/render   L2  CPU oracle renderer (coverage accumulation, paints, strokes, PNG)
 crates/xfl      L2  XFL/FLA import: own XML + zip readers, edges → paths (ADR 0009)
 crates/svg      L2  SVG import: shapes, groups, use, styles, gradients, clips/masks → mask layers, text

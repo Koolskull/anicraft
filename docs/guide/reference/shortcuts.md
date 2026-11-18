@@ -31,6 +31,7 @@ This page is generated from the editor's shortcut map, so it always matches the 
 | Pencil | Shift+Y | ⇧Y |
 | Brush | B | B |
 | Paint Brush | Y | Y |
+| Raster | D | D |
 | Eraser | E | E |
 | Rectangle | R | R |
 | Oval | O | O |

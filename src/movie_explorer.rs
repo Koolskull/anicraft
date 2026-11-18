@@ -103,6 +103,7 @@ fn kind_name(k: NodeKind) -> &'static str {
         NodeKind::Layer(LayerKind::Guide) => tr_noop!("Guide layer"),
         NodeKind::Layer(LayerKind::Camera) => tr_noop!("Camera layer"),
         NodeKind::Layer(LayerKind::Armature) => tr_noop!("Armature layer"),
+        NodeKind::Layer(LayerKind::Raster) => tr_noop!("Pixel layer"),
         NodeKind::Layer(LayerKind::Normal) => tr_noop!("Layer"),
         NodeKind::Frame => tr_noop!("Keyframe"),
         NodeKind::Script => tr_noop!("Frame script"),
@@ -154,6 +155,7 @@ fn marker(p: &egui::Painter, at: Rect, k: NodeKind, c: egui::Color32) {
         NodeKind::Layer(LayerKind::Guide) => icons::paint(p, at, Icon::Guide, c),
         NodeKind::Layer(LayerKind::Camera) => icons::paint(p, at, Icon::Camera, c),
         NodeKind::Layer(LayerKind::Armature) => icons::paint(p, at, Icon::Bone, c),
+        NodeKind::Layer(LayerKind::Raster) => icons::paint(p, at, Icon::Image, c),
         NodeKind::Layer(LayerKind::Normal) => {
             p.rect_stroke(at.shrink(2.0), 1.0, Stroke::new(1.2, c), StrokeKind::Inside);
         }

@@ -1,6 +1,6 @@
 # Command reference
 
-Everything you can do in AniCraft is a command: the menus, the shortcuts, the command palette (**Ctrl+K**, macOS **⌘K**), `anicraft-cli` and AI assistants over MCP all run the same 352 commands, listed here by menu. The id is what scripts and [working headless](../working-headless.md) use; the parameters are what a command takes as JSON. Commands that change the document are one undo step each. Your own shortcuts (**F1**) replace the defaults shown here; see the [shortcut reference](shortcuts.md).
+Everything you can do in AniCraft is a command: the menus, the shortcuts, the command palette (**Ctrl+K**, macOS **⌘K**), `anicraft-cli` and AI assistants over MCP all run the same 354 commands, listed here by menu. The id is what scripts and [working headless](../working-headless.md) use; the parameters are what a command takes as JSON. Commands that change the document are one undo step each. Your own shortcuts (**F1**) replace the defaults shown here; see the [shortcut reference](shortcuts.md).
 
 This page is generated from the command registry, so it always matches the version of AniCraft it came with.
 
@@ -68,11 +68,11 @@ This page is generated from the command registry, so it always matches the versi
 - **Select All** `edit.select_all` · **Ctrl+A** (macOS **⌘A**)
   Parameters: `{}`
 - **Deselect All** `edit.deselect` · **Ctrl+Shift+A** (macOS **⇧⌘A**)
-  Parameters: `{}`
+  Parameters: `{} lets go of elements and of a raster crop`
 - **Clear** `edit.delete` · **Delete** (macOS **⌫**) · changes the document
-  Parameters: `{} (on every layer with selected items)`
+  Parameters: `{} (on every layer with selected items; a raster crop is cleared too)`
 - **Duplicate** `edit.duplicate` · **Ctrl+D** (macOS **⌘D**) · changes the document
-  Parameters: `{dx?, dy?} (each copy on its original's layer)`
+  Parameters: `{dx?, dy?} (each copy on its original's layer; a raster crop is copied too and the original stays)`
 - **Cut** `edit.cut` · **Ctrl+X** (macOS **⌘X**) · changes the document
   Parameters: `{}`
 - **Copy** `edit.copy` · **Ctrl+C** (macOS **⌘C**)
@@ -137,6 +137,8 @@ This page is generated from the command registry, so it always matches the versi
   Parameters: `{layer?, frame?} (a motion tween leaves its object as it is on the first frame)`
 - **New Layer** `layer.new` · Insert › Timeline · changes the document
   Parameters: `{name?}`
+- **Raster Layer** `layer.new_raster` · Insert › Timeline · changes the document
+  Parameters: `{name?} a transparent pixel layer the size of the stage`
 - **New Folder** `layer.new_folder` · Insert › Timeline · changes the document
   Parameters: `{name?}`
 - **Add Classic Motion Guide** `layer.add_motion_guide` · Insert › Timeline · changes the document
@@ -195,7 +197,7 @@ This page is generated from the command registry, so it always matches the versi
 - **Send to Back** `arrange.send_to_back` · Modify › Arrange · **Ctrl+Shift+Down** (macOS **⇧⌘↓**) · changes the document
   Parameters: `{} (within each layer)`
 - **Convert to Symbol…** `modify.convert_to_symbol` · **F8** · changes the document
-  Parameters: `{name? (default: the next free “Symbol n”; a name the folder holds gets a number), kind?: graphic|movie_clip|button (default: graphic), folder?: Library folder id (default: the top level)} → {symbol, instance, name, layer, folder} (a selection on several layers becomes one symbol with those layers inside; the instance lands on the topmost)`
+  Parameters: `{name? (default: the next free “Symbol n”; a name the folder holds gets a number), kind?: graphic|movie_clip|button (default: graphic), folder?: Library folder id (default: the top level)} → {symbol, instance, name, layer, folder} (a selection on several layers becomes one symbol with those layers inside; the instance lands on the topmost) A raster crop becomes a bitmap inside the symbol and leaves a hole on the plate; the instance is a new layer above that plate.`
 - **Break Apart** `modify.break_apart` · **Ctrl+B** (macOS **⌘B**) · changes the document
   Parameters: `{} the selected symbol instances become their contents, text becomes shapes, and drawing objects become raw shapes that merge with the raw shapes they touch`
 - **Group** `modify.group` · **Ctrl+G** (macOS **⌘G**) · changes the document
@@ -490,9 +492,9 @@ These commands have no menu item: the panels, the stage and the timeline use the
 - **Select Elements** `element.select`
   Parameters: ``{ids: [..], add?: bool, toggle?: bool, layer?} selects elements on any visible, unlocked layer at the playhead (ids are unique; `layer` looks only there); `toggle` takes each one that is selected out of the selection and adds the others (Shift+Space on a stage element); the active layer becomes the first one's unless it has some of them``
 - **Select at Point** `element.pick`
-  Parameters: ``{x, y, add?: bool, view?: stage|camera} the topmost element there on a visible, unlocked layer; `add` (Shift) adds it to the selection, or lets go of it, on any layer; with `view: camera` the point is on the movie's picture as the camera shows it (each layer through its depth)``
+  Parameters: ``{x, y, add?: bool, view?: stage|camera} the topmost element there on a visible, unlocked layer; `add` (Shift) adds it to the selection, or lets go of it, on any layer; with `view: camera` the point is on the movie's picture as the camera shows it (each layer through its depth) An opaque pixel on a raster layer selects that plate's crop, tight around the ink, leaving out the clear margin.``
 - **Move** `element.translate` · changes the document
-  Parameters: ``{dx, dy, snap?, from?: [x, y]} moves the selection, on every layer; with `snap` (a distance) one of its corners or ends, or its box's corners or centre (the nearest to `from`), then snaps within that distance by the snap engine's priority (ADR 0076): a point, guide, line or fill edge of the rest, the grid, a whole pixel``
+  Parameters: ``{dx, dy, snap?, from?: [x, y]} moves the selection, on every layer; with `snap` (a distance) one of its corners or ends, or its box's corners or centre (the nearest to `from`), then snaps within that distance by the snap engine's priority (ADR 0076): a point, guide, line or fill edge of the rest, the grid, a whole pixel A raster crop moves with it.``
 - **Transform** `element.set_transform` · changes the document
   Parameters: `{x?, y?, sx?, sy?, rotation? (degrees)}`
 - **Fill Colour** `element.set_fill` · changes the document
@@ -552,7 +554,7 @@ These commands have no menu item: the panels, the stage and the timeline use the
 - **Select Connected** `element.select_connected`
   Parameters: `{x, y, add?, slop?} a raw stroke and the strokes joined to it, or a raw fill and the strokes on and in it`
 - **Transform** `modify.transform` · changes the document
-  Parameters: `{a, b, c, d, e, f} affine applied in stage space (free transform), to the selection on every layer`
+  Parameters: `{a, b, c, d, e, f} affine applied in stage space (free transform), to the selection on every layer A raster crop is resampled with it, from the picture at the start of the drag.`
 - **Pen Path** `draw.path` · changes the document
   Parameters: `{d: SVG path data (stage space), fill?, stroke?, stroke_width?, object?}`
 - **Pencil Stroke** `draw.freehand` · changes the document
@@ -570,7 +572,7 @@ These commands have no menu item: the panels, the stage and the timeline use the
 - **Move Point** `raw.move_point` · changes the document
   Parameters: ``{x, y, to_x, to_y, with?: [[x, y], ..], points?: [[id, cmd], ..], snap?, slop?, merge?: bool} moves the corner or end at (x, y), with every raw shape that shares it, to (to_x, to_y), snapped within `snap` to points, lines and fill edges (while Snap to Objects is on); the anchors at `with` move by as much; returns the points to pass on while a drag goes on``
 - **Select Parts** `raw.select_rect` · changes the document
-  Parameters: `{x0, y0, x1, y1, add?: bool} the marquee, on every visible, unlocked layer: the parts of raw fills and strokes under the rectangle (cut at its edges, per layer) and the objects wholly inside it`
+  Parameters: `{x0, y0, x1, y1, add?: bool} the marquee, on every visible, unlocked layer: the parts of raw fills and strokes under the rectangle (cut at its edges, per layer) and the objects wholly inside it Opaque pixels inside it become one raster crop, tight around the ink.`
 - **Merge Shapes** `raw.merge` · changes the document
   Parameters: `{ids?: [..]} the raw shapes (default: the selection) merge again with the raw shapes they touch, in place`
 - **Selection Tool Target** `raw.hit`
@@ -655,6 +657,8 @@ These commands have no menu item: the panels, the stage and the timeline use the
   Parameters: `{element?: id (default: the selected shapes with a gradient or bitmap fill), frame?: [a, b, c, d, e, f] (the fill's frame in the space being edited: the box -1..1 onto a linear gradient's span, a radial gradient's ring or one copy of a bitmap), or changes made in this order: scale_x?, scale_y?, scale? (along the frame's own axes), skew_x?, skew_y? (degrees, along its axes), rotate? (degrees, about its centre), move?: [dx, dy], center?: [x, y]; focal?: -0.98..0.98 (radial)} moves, turns, scales or skews where a gradient or bitmap fill lies, as the Gradient Transform tool (F) does → {changed, frames: [[a, b, c, d, e, f], ..]}`
 - **Lock Fill** `paint.lock_fill`
   Parameters: `{on?: bool (default: toggle)} Lock Fill: a gradient or bitmap from the fill swatch is poured where it lies on the stage, running on across shapes; off, each shape gets it fitted to its bounds → {on}`
+- **Paint Pixels** `paint.raster` · changes the document
+  Parameters: `{x, y, pressure?} or {samples: [{x, y, pressure?}, …]}, size?, size_min?, softness?, antialias?: 0|0.5|1|2, color? (default: the fill colour, alpha included), erase?: bool, smudge?: bool, strength?, opacity_from_pressure?: bool (default true: coverage runs from opacity_min at no pressure to opacity_max at full pressure), opacity_min?, opacity_max? (0..1, default 0 and 1), flow?: 0..1 (default 1: the stronger dab wins; below 1 each dab deposits that share), speckle?: 0..1 (default 0: one solid dab; higher sprays tiny dots of mixed size and opacity inside the brush), grain?: 0..1 (default 0: paper tooth that stays on the page), wedge?: 0..1 (default 0: a round dab; higher lays the tip on its side, a sharp edge and a soft fade in the direction of the stroke, and a point with no direction stays round), picture?: 0|1|2|3|4 (default 0: the round or grain dab; 1 fine spray, 2 heavy spray, 3 tight dot, 4 spray can; each dab is that picture, turned), continued?: bool}. On a vector layer this adds a raster layer first. Smudge blends colours already on the plate and does not add a hue. strength 1 replaces the disc for the whole stroke. The Raster tool's Stretch slider tops out lower. The colour's alpha is the opacity of the whole stroke, not of each dab. Flow 1 keeps that wash. A lower flow builds up inside it and still stops at the fill's alpha. The Raster tool sends the fill colour and leaves pressure opacity off unless its Opacity switch is on. continued skips the first sample, which the previous move already painted`
 - **Swatches** `swatch.list`
   Parameters: `{} the document's swatches, in the Swatches panel's order → {swatches: [{index, name, type, color | stops, ..}], count}`
 - **Add Swatch** `swatch.add` · changes the document

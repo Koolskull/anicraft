@@ -13,7 +13,7 @@ pub struct BitmapId(pub u64);
 pub const MAX_BITMAP_EDGE: u32 = 8192;
 
 /// Decoded pixels: `width × height` straight-alpha RGBA8, row by row.
-#[derive(Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct Pixels {
     pub width: u32,
     pub height: u32,

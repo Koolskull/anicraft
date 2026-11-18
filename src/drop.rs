@@ -449,6 +449,7 @@ fn layer_refusal(app: &App, layer: LayerId) -> Option<String> {
         LayerKind::Folder => Some(tr!("{layer} is a folder: drop on one of its layers", layer = l.name)),
         LayerKind::Camera => Some(tr!("{layer} is the camera layer: drop on a layer below it", layer = l.name)),
         LayerKind::Armature => Some(tr!("{layer} holds an armature: drop on another layer", layer = l.name)),
+        LayerKind::Raster => Some(tr!("{layer} is a pixel layer: paint it with the Raster tool", layer = l.name)),
         _ if l.locked || tl.locked_by_folder(layer) => Some(tr!("{layer} is locked: unlock it to drop onto it", layer = l.name)),
         _ => None,
     }

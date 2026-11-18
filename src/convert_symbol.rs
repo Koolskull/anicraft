@@ -32,7 +32,8 @@ pub fn remembered(doc: &Document, last: Last) -> Option<FolderId> {
 
 /// Opens the dialog for the selection, with the next free "Symbol n" in the remembered folder.
 pub fn open(app: &mut App) {
-    if app.s.selection.is_empty() {
+    let pixels = app.s.raster_pick().is_some();
+    if app.s.selection.is_empty() && !pixels {
         // The engine says why ("select something to convert").
         app.request("modify.convert_to_symbol", json!({}));
         return;
@@ -40,7 +41,9 @@ pub fn open(app: &mut App) {
     app.playing = false;
     let folder = remembered(&app.s.doc, app.convert_last);
     let name = app.s.doc.numbered_name(folder, "Symbol", app.s.doc.library.len() + 1); // i18n-exempt: a new symbol's default name is document text, as the engine gives it
-    app.convert = Some(ConvertDialog { name, kind: app.convert_last.kind, folder, focus: true });
+    // A crop on its own becomes a movie clip. Mixed artwork keeps the type used last.
+    let kind = if app.s.selection.is_empty() { SymbolKind::MovieClip } else { app.convert_last.kind };
+    app.convert = Some(ConvertDialog { name, kind, folder, focus: true });
 }
 
 fn kind_key(k: SymbolKind) -> &'static str {

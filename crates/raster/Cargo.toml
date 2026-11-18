@@ -1,0 +1,11 @@
+[package]
+name = "anicraft-raster"
+description = "AniCraft L1: pixel dabs, smudge, and clip-to-alpha on a cropped RGBA cel"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+repository.workspace = true
+
+[lints]
+workspace = true

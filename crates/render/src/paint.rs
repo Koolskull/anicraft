@@ -1,6 +1,6 @@
 //! Paint shaders: solid colours and gradients evaluated per pixel through a 256-entry LUT.
 
-use anicraft_doc::{ColorTransform, GradientStop, MAX_FOCAL, Paint, Pixels, Rgba, Spread};
+use anicraft_doc::{ColorTransform, GradientStop, MAX_FOCAL, Paint, Pixels, PlateDraw, Rgba, Spread};
 use std::sync::Arc;
 use anicraft_geom::{Affine, Vec2};
 
@@ -23,7 +23,7 @@ pub enum Shader {
     Radial { inv: Affine, center: Vec2, inv_radius: f32, focal: f32, spread: Spread, lut: Box<[Premul; LUT]> },
     /// Samples of a bitmap: `inv` maps pixels back to the bitmap's own pixel grid. Bilinear
     /// when `smooth` (Allow Smoothing, ADR 0050), else the nearest pixel.
-    Bitmap { inv: Affine, pixels: Arc<Pixels>, repeat: bool, fx: ColorTransform, smooth: bool },
+    Bitmap { inv: Affine, pixels: Arc<Pixels>, repeat: bool, fx: ColorTransform, smooth: bool, plate: Option<PlateDraw> },
     /// Premultiplied pixels already in surface space (a filtered group): `w` wide, its top-left
     /// at `(x0, y0)`; transparent outside.
     Image { data: Arc<Vec<Premul>>, x0: i32, y0: i32, w: usize },
@@ -119,7 +119,7 @@ impl Shader {
             }
             (Paint::Bitmap { repeat, matrix, .. }, Some(inv)) => match (image, matrix.inverse()) {
                 // Pixel → shape space → image pixels.
-                (Some(px), Some(to_image)) => Shader::Bitmap { inv: to_image.mul(&inv), pixels: px.clone(), repeat: *repeat, fx: *fx, smooth: true },
+                (Some(px), Some(to_image)) => Shader::Bitmap { inv: to_image.mul(&inv), pixels: px.clone(), repeat: *repeat, fx: *fx, smooth: true, plate: None },
                 // A collapsed image matrix shows nothing.
                 (Some(_), None) => Shader::Solid([0.0; 4]),
                 (None, _) => Shader::Solid(premultiply(fx.apply(paint.primary_color()))),
@@ -156,7 +156,7 @@ impl Shader {
             Shader::Solid(c) => *c,
             Shader::Linear { inv, start, dir, spread, lut } => lookup(lut, *spread, (inv.apply(p) - *start).dot(*dir)),
             Shader::Radial { inv, center, inv_radius, focal, spread, lut } => lookup(lut, *spread, focal_t((inv.apply(p) - *center) * *inv_radius, *focal)),
-            Shader::Bitmap { inv, pixels, repeat, fx, smooth } => sample(pixels, inv.apply(p), *repeat, *smooth, fx),
+            Shader::Bitmap { inv, pixels, repeat, fx, smooth, .. } => sample(pixels, inv.apply(p), *repeat, *smooth, fx),
             Shader::Image { data, x0, y0, w } => {
                 let (dx, dy) = (x - x0, y - y0);
                 if dx < 0 || dy < 0 || dx as usize >= *w {

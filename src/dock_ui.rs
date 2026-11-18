@@ -348,6 +348,12 @@ pub fn workspace(app: &mut App, ui: &mut egui::Ui) {
     let mut acts = Vec::new();
     if let Some(side) = layout.tools_bar {
         tools_bar(app, ui, side, &layout, &mut acts);
+        if app.tool == crate::app::Tool::Pixel {
+            let beside = if side == Side::Right { Side::Right } else { Side::Left };
+            crate::pixeltool::preset_bar(app, ui, beside);
+        }
+    } else if app.tool == crate::app::Tool::Pixel {
+        crate::pixeltool::preset_bar(app, ui, Side::Left);
     }
     for side in [Side::Left, Side::Right, Side::Bottom, Side::Top] {
         let zone = layout.zone(side);

@@ -879,11 +879,17 @@ fn prepare(item: &DisplayItem, view: &Affine, surface: IRect, soft: bool) -> Vec
             (Some(mesh), Paint::Bitmap { repeat, matrix, .. }, Some(px)) => {
                 let prepared = pixel_bounds(&polys, surface).and_then(|b| Some((warp::texture(mesh, &m, matrix, *repeat, px, item.smooth, b)?, b)));
                 match prepared {
-                    Some((tex, b)) => Shader::Bitmap { inv: Affine::translate(-(b.x0 as f32), -(b.y0 as f32)), pixels: tex, repeat: false, fx: item.color, smooth: false },
+                    Some((tex, b)) => Shader::Bitmap { inv: Affine::translate(-(b.x0 as f32), -(b.y0 as f32)), pixels: tex, repeat: false, fx: item.color, smooth: false, plate: None },
                     None => Shader::Solid([0.0; 4]),
                 }
             }
-            _ => Shader::new(fill, &m, &item.color, item.image.as_ref()).smoothed(item.smooth),
+            _ => {
+                let mut shader = Shader::new(fill, &m, &item.color, item.image.as_ref()).smoothed(item.smooth);
+                if let Shader::Bitmap { plate, .. } = &mut shader {
+                    *plate = item.plate;
+                }
+                shader
+            }
         };
         push(polys, item.fill_rule, shader);
     }
@@ -975,6 +981,7 @@ mod tests {
             image: None,
             smooth: true,
             warp: None,
+            plate: None,
         }
     }
 

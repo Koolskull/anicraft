@@ -33,6 +33,8 @@ pub struct Snapshot {
     pub frame: u32,
     pub layer: LayerId,
     pub selection: crate::Selection,
+    /// The raster crop, when one was held (ADR 0115). The lifted picture is not stored.
+    pub raster_pick: Option<crate::raster_crop::RasterPick>,
     /// Estimated bytes this snapshot keeps alive that the neighbouring state does not share.
     pub bytes: usize,
 }
@@ -196,6 +198,9 @@ fn keyframe_bytes(k: &Keyframe, other: Option<&Keyframe>) -> usize {
         if !shared_els.contains(&ptr(e)) {
             b += element_bytes(e, &shared_paths);
         }
+    }
+    if let Some(plate) = &k.plate {
+        b += plate.unique_row_bytes(other.and_then(|o| o.plate.as_ref()));
     }
     b
 }

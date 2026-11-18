@@ -36,6 +36,7 @@ pub fn specs() -> Vec<CommandSpec> {
             Ok(json!({"frame": f}))
         }),
         c("layer.new", "New Layer", "Insert/Timeline", None, "{name?}", true, new_layer),
+        c("layer.new_raster", "Raster Layer", "Insert/Timeline", None, "{name?} a transparent pixel layer the size of the stage", true, new_raster),
         c("layer.new_folder", "New Folder", "Insert/Timeline", None, "{name?}", true, new_folder),
         c("layer.delete", "Delete Layer", "Modify/Timeline", None, "{layer? (a folder goes with its contents)}", true, delete_layer),
         c("layer.rename", "Rename Layer", "", None, "{name, layer?}", true, rename_layer),
@@ -139,6 +140,9 @@ pub(crate) fn set_type(s: &mut Session, id: LayerId, ty: &str) -> Result<()> {
     if tl.layers.get(i).is_some_and(|l| l.kind == LayerKind::Armature) {
         return Err(EngineError::State("an armature layer holds its armature; it can't become another kind of layer (removing its bones frees the instances)".into()));
     }
+    if tl.layers.get(i).is_some_and(|l| l.kind == LayerKind::Raster) {
+        return Err(EngineError::State("a pixel layer holds pixels; it can't become another kind of layer".into()));
+    }
     // Whatever the type, the layer stays in the folder it is in.
     let folder = tl.folder_of(i);
     let (kind, parent) = match ty {
@@ -174,6 +178,7 @@ pub(crate) fn layer_type_json(s: &Session, id: LayerId) -> Value {
         LayerKind::Folder => "folder",
         LayerKind::Camera => "camera",
         LayerKind::Armature => "armature",
+        LayerKind::Raster => "raster",
         LayerKind::Normal if masked_by.is_some() => "masked",
         LayerKind::Normal if guided_by.is_some() => "guided",
         LayerKind::Normal => "normal",
@@ -367,6 +372,7 @@ pub(crate) fn insert_keyframe_at(layer: &mut Layer, frame: u32, copy: bool) -> R
                 k.tween = None;
                 k.motion = None;
                 k.pose = anicraft_doc::Pose::default();
+                k.plate = None;
             }
         }
         return Ok(());
@@ -401,6 +407,9 @@ pub(crate) fn insert_keyframe_at(layer: &mut Layer, frame: u32, copy: bool) -> R
             nk.tween = tween;
             nk.motion = motion;
             nk.pose = pose.unwrap_or_default();
+            if copy {
+                nk.plate = k.plate.clone();
+            }
             layer.keyframes.insert(i + 1, Arc::new(nk));
         }
         None => {
@@ -413,6 +422,7 @@ pub(crate) fn insert_keyframe_at(layer: &mut Layer, frame: u32, copy: bool) -> R
                     if copy {
                         nk.elements = last_state.unwrap_or_else(|| k.elements.clone());
                         nk.pose = k.pose.clone();
+                        nk.plate = k.plate.clone();
                     }
                     k.duration = frame - k.start;
                 }
@@ -752,6 +762,24 @@ pub(crate) fn layer_color(n: usize) -> anicraft_doc::Rgba {
     // The first seven of the layer colours, in turn.
     const TURN: usize = 7;
     anicraft_doc::Rgba::hex(crate::LAYER_COLORS.get(n % TURN).copied().unwrap_or(0x4fa3ff))
+}
+
+/// A transparent pixel layer the size of the stage (ADR 0112). The buffer is made on the first stroke.
+pub(crate) fn new_raster(s: &mut Session, p: &Value) -> Result<Value> {
+    let (w, h) = (s.doc.stage.width, s.doc.stage.height);
+    if !anicraft_doc::RasterPlate::fits(w, h) {
+        return Err(EngineError::State(format!("this stage is {w}×{h}, which is too large for a pixel layer")));
+    }
+    let n = s.timeline().layers.iter().filter(|l| l.kind == LayerKind::Raster).count() + 1;
+    // A missing name is fine. Indexing a non-object panics, and the command fuzzer sends those.
+    let named = if opt_str(p, "name")?.is_some() {
+        p.clone()
+    } else {
+        let mut q = p.as_object().cloned().map(Value::Object).unwrap_or_else(|| json!({}));
+        q["name"] = json!(format!("Raster {n}"));
+        q
+    };
+    add_layer(s, &named, LayerKind::Raster)
 }
 
 fn add_layer(s: &mut Session, p: &Value, kind: LayerKind) -> Result<Value> {

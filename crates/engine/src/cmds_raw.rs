@@ -46,7 +46,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "Select Parts",
             "",
             None,
-            "{x0, y0, x1, y1, add?: bool} the marquee, on every visible, unlocked layer: the parts of raw fills and strokes under the rectangle (cut at its edges, per layer) and the objects wholly inside it",
+            "{x0, y0, x1, y1, add?: bool} the marquee, on every visible, unlocked layer: the parts of raw fills and strokes under the rectangle (cut at its edges, per layer) and the objects wholly inside it Opaque pixels inside it become one raster crop, tight around the ink.",
             true,
             select_rect,
         ),
@@ -612,6 +612,7 @@ fn select_rect(s: &mut Session, p: &Value) -> Result<Value> {
     let r = Rect::from_points(a, b);
     if !add {
         s.selection.clear();
+        crate::raster_crop::clear_pick(s);
     }
     if r.width() <= 0.0 || r.height() <= 0.0 {
         return Ok(json!({"selected": s.selection.id_list(), "cut": 0}));
@@ -656,6 +657,14 @@ fn select_rect(s: &mut Session, p: &Value) -> Result<Value> {
         && let Some(&top) = hit.first()
     {
         s.layer = top;
+    }
+    // Opaque ink inside the marquee, on the topmost raster layer that has any. One box.
+    if let Some(crop) = crate::raster_crop::bounds_in(s, r) {
+        let layer = crop.layer;
+        crate::raster_crop::add_pick(s, crop);
+        if hit.is_empty() {
+            s.layer = layer;
+        }
     }
     Ok(json!({"selected": s.selection.id_list(), "cut": cut}))
 }

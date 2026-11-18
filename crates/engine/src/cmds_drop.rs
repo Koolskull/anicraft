@@ -224,6 +224,7 @@ fn onto_timeline(s: &mut Session, p: &Value, files: &[PathBuf], x: f32, y: f32) 
         anicraft_doc::LayerKind::Folder => Some("is a folder: drop on one of its layers"),
         anicraft_doc::LayerKind::Camera => Some("is the camera layer: drop on a layer below it"),
         anicraft_doc::LayerKind::Armature => Some("holds an armature, posed by its bones: drop on another layer"),
+        anicraft_doc::LayerKind::Raster => Some("is a pixel layer: paint it with the Raster tool"),
         _ if l.locked || tl.locked_by_folder(layer) => Some("is locked: unlock it to drop onto it"),
         _ => None,
     };

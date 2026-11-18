@@ -422,7 +422,8 @@ fn enabled(app: &App, id: &str) -> bool {
     match id {
         "edit.undo" => app.s.can_undo(),
         "edit.redo" => app.s.can_redo(),
-        "edit.delete" | "edit.duplicate" | "modify.convert_to_symbol" | "modify.break_apart" | "arrange.bring_to_front" | "arrange.send_to_back" => !app.s.selection.is_empty(),
+        "edit.delete" | "edit.duplicate" | "modify.convert_to_symbol" => !app.s.selection.is_empty() || app.s.raster_pick().is_some(),
+        "modify.break_apart" | "arrange.bring_to_front" | "arrange.send_to_back" => !app.s.selection.is_empty(),
         "layer.delete" => app.s.timeline().layers.len() > 1,
         "scene.delete" => app.s.doc.scenes.len() > 1,
         // Ctrl+E opens the selected instance, or goes back to the document (ADR 0045).

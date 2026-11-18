@@ -185,7 +185,7 @@ fn paint_cell(p: &egui::Painter, app: &App, layers: &[Arc<Layer>], i: usize, lay
             let motion = k.motion.is_some();
             let shape = k.tween.as_ref().is_some_and(|t| t.kind == TweenKind::Shape);
             let tweened = k.tween.is_some() && next && !motion;
-            let empty = k.elements.is_empty();
+            let empty = !k.has_content();
             let fill = if motion {
                 T.tween_motion
             } else if tweened && shape {
@@ -268,7 +268,7 @@ fn span_color(k: &anicraft_engine::doc::Keyframe, layer: &Layer) -> Color32 {
         T.tween_shape
     } else if k.tween.is_some() && next {
         T.tween
-    } else if k.elements.is_empty() {
+    } else if !k.has_content() {
         T.span_empty
     } else {
         T.span

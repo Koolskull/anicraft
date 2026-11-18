@@ -79,6 +79,7 @@ fn type_label(ty: &str) -> &'static str {
         "folder" => tr!("Folder"),
         "camera" => tr!("Camera"),
         "armature" => tr!("Armature"),
+        "raster" => tr!("Raster"),
         other => types().into_iter().find(|(k, _)| *k == other).map_or(tr!("Normal"), |(_, n)| n),
     }
 }
@@ -96,7 +97,7 @@ pub fn window(app: &mut App, ctx: &egui::Context) {
         let kind = i.and_then(|i| tl.layers.get(i)).map_or(LayerKind::Normal, |l| l.kind);
         (i.and_then(|i| tl.mask_above(i)).is_some(), i.and_then(|i| tl.guide_above(i)).is_some(), kind)
     };
-    let fixed = matches!(kind, LayerKind::Folder | LayerKind::Camera | LayerKind::Armature);
+    let fixed = matches!(kind, LayerKind::Folder | LayerKind::Camera | LayerKind::Armature | LayerKind::Raster);
     let (mut submit, mut cancel) = (false, false);
     egui::Window::new(tr!("Layer Properties")).id(egui::Id::new("layer_props")).collapsible(false).resizable(false).anchor(egui::Align2::CENTER_CENTER, [0.0, -80.0]).show(ctx, |ui| {
         ui.set_min_width(420.0);

@@ -69,11 +69,24 @@ pub struct Cache {
     pub drawn_by: Option<(bool, Option<String>)>,
     /// The selection pattern's texture and the colour it was made in (`selection_pattern`).
     pattern: Option<(Color32, egui::TextureHandle)>,
+    /// A raster drag is on screen, or its tiles have not caught up yet (ADR 0113).
+    plate_hold: bool,
+    /// Plate textures drawn while `plate_hold`, keyed by stamp.
+    plate_tex: Vec<PlateTex>,
+}
+
+/// One plate shown directly, so a stroke does not wait on a scene tile.
+struct PlateTex {
+    stamp: u64,
+    generation: u64,
+    width: u32,
+    height: u32,
+    tex: egui::TextureHandle,
 }
 
 impl Default for Cache {
     fn default() -> Self {
-        Cache { tiles: Vec::new(), tick: 0, ms: 0.0, ready: (0, 0), canvas: Rect::from_min_size(Pos2::ZERO, vec2(800.0, 600.0)), service: None, shown_state: None, gpu: Default::default(), drawn_by: None, pattern: None }
+        Cache { tiles: Vec::new(), tick: 0, ms: 0.0, ready: (0, 0), canvas: Rect::from_min_size(Pos2::ZERO, vec2(800.0, 600.0)), service: None, shown_state: None, gpu: Default::default(), drawn_by: None, pattern: None, plate_hold: false, plate_tex: Vec::new() }
     }
 }
 
@@ -222,8 +235,356 @@ fn stroke_box(painter: &egui::Painter, min: Vec2, max: Vec2, to_screen: &impl Fn
     painter.add(egui::Shape::closed_line(box_quad(min, max, to_screen).to_vec(), stroke));
 }
 
+/// State id for the plate-free tiles of one raster drag. The high bit keeps it off real states.
+fn plate_live_state(base: anicraft_engine::StateId) -> anicraft_engine::StateId {
+    base.wrapping_mul(0x9E37_79B9_7F4A_7C15).wrapping_add(0x0105) | (1 << 63)
+}
+
+/// Drop plates from a picture clone so its tiles stay the scene under the stroke.
+fn hide_raster_plates(doc: &mut anicraft_engine::doc::Document) {
+    let n = doc.scenes.len();
+    for i in 0..n {
+        let tl = doc.timeline_mut(i);
+        for layer in &mut tl.layers {
+            if layer.keyframes.iter().all(|k| k.plate.is_none()) {
+                continue;
+            }
+            let layer = std::sync::Arc::make_mut(layer);
+            for kf in &mut layer.keyframes {
+                if kf.plate.is_some() {
+                    std::sync::Arc::make_mut(kf).plate = None;
+                }
+            }
+        }
+    }
+}
+
+/// One solid shape in a multiply group that sits above the raster ink (the 2kool grid).
+struct Wash {
+    x0: i32,
+    y0: i32,
+    x1: i32,
+    y1: i32,
+    /// Straight colour, before the group's alpha.
+    rgba: [f32; 4],
+    group: u32,
+    group_alpha: f32,
+}
+
+/// Straight plate pixel over opaque paper. The result is straight and opaque.
+fn over_paper(px: [u8; 4], paper: [f32; 3]) -> [f32; 3] {
+    let a = f32::from(px[3]) / 255.0;
+    let inv = 1.0 - a;
+    let s = |c: u8| f32::from(c) / 255.0;
+    [s(px[0]) * a + paper[0] * inv, s(px[1]) * a + paper[1] * inv, s(px[2]) * a + paper[2] * inv]
+}
+
+fn shape_premul(rgba: [f32; 4]) -> [f32; 4] {
+    let a = rgba[3].clamp(0.0, 1.0);
+    [rgba[0] * a, rgba[1] * a, rgba[2] * a, a]
+}
+
+fn over_premul(s: [f32; 4], d: [f32; 4]) -> [f32; 4] {
+    let inv = 1.0 - s[3];
+    [s[0] + d[0] * inv, s[1] + d[1] * inv, s[2] + d[2] * inv, s[3] + d[3] * inv]
+}
+
+/// W3C multiply of a group (premultiplied, then scaled by the group's alpha) over an opaque backdrop.
+fn multiply_group(group: [f32; 4], alpha: f32, backdrop: [f32; 3]) -> [f32; 3] {
+    let s = [group[0] * alpha, group[1] * alpha, group[2] * alpha, group[3] * alpha];
+    let sa = s[3].clamp(0.0, 1.0);
+    if sa <= 1e-6 {
+        return backdrop;
+    }
+    let mut out = [0.0; 3];
+    for i in 0..3 {
+        let cs = (s[i] / sa).clamp(0.0, 1.0);
+        out[i] = backdrop[i] * ((1.0 - sa) + sa * cs);
+    }
+    out
+}
+
+fn to_byte(v: f32) -> u8 {
+    (v.clamp(0.0, 1.0) * 255.0).round() as u8
+}
+
+/// Bake multiply shapes into ink pixels so the live plate does not cover them.
+/// A clear plate pixel stays clear: the scene tile already has the grid there.
+fn shade_row(row: &mut [u8], y: i32, paper: [f32; 3], washes: &[Wash]) {
+    let width = row.len() / 4;
+    if width == 0 || washes.is_empty() {
+        return;
+    }
+    let on_row: Vec<usize> = washes.iter().enumerate().filter(|(_, w)| y >= w.y0 && y < w.y1).map(|(i, _)| i).collect();
+    if on_row.is_empty() {
+        return;
+    }
+    let mut x = 0i32;
+    let limit = width as i32;
+    while x < limit {
+        let mut next = limit;
+        let mut end = x;
+        let mut covered = false;
+        for &i in &on_row {
+            let w = &washes[i];
+            if w.x1 <= x {
+                continue;
+            }
+            if w.x0 > x {
+                next = next.min(w.x0);
+                continue;
+            }
+            covered = true;
+            end = end.max(w.x1);
+        }
+        if !covered {
+            x = next;
+            continue;
+        }
+        let stop = end.min(limit);
+        while x < stop {
+            let at = x as usize * 4;
+            let Some(px) = row.get(at..at + 4) else { break };
+            if px[3] != 0 {
+                let bytes = [px[0], px[1], px[2], px[3]];
+                let mut backdrop = over_paper(bytes, paper);
+                let mut i = 0;
+                while i < on_row.len() {
+                    let group = washes[on_row[i]].group;
+                    let alpha = washes[on_row[i]].group_alpha;
+                    let mut premul = [0.0; 4];
+                    let mut any = false;
+                    while i < on_row.len() && washes[on_row[i]].group == group {
+                        let w = &washes[on_row[i]];
+                        if x >= w.x0 && x < w.x1 {
+                            premul = over_premul(shape_premul(w.rgba), premul);
+                            any = true;
+                        }
+                        i += 1;
+                    }
+                    if any {
+                        backdrop = multiply_group(premul, alpha, backdrop);
+                    }
+                }
+                if let Some(dst) = row.get_mut(at..at + 4) {
+                    dst[0] = to_byte(backdrop[0]);
+                    dst[1] = to_byte(backdrop[1]);
+                    dst[2] = to_byte(backdrop[2]);
+                    dst[3] = 255;
+                }
+            }
+            x += 1;
+        }
+    }
+}
+
+fn shade_rows(bytes: &mut [u8], width: u32, y0: u32, washes: &[Wash], paper: [f32; 3]) {
+    if washes.is_empty() || width == 0 {
+        return;
+    }
+    let stride = (width as usize).saturating_mul(4);
+    if stride == 0 {
+        return;
+    }
+    let rows = bytes.len() / stride;
+    for i in 0..rows {
+        let start = i.saturating_mul(stride);
+        let Some(row) = bytes.get_mut(start..start + stride) else { continue };
+        shade_row(row, y0.saturating_add(i as u32) as i32, paper, washes);
+    }
+}
+
+/// Axis-aligned rectangles in a path, in stage pixels. A compound path (the grid is two of
+/// these, faint and solid) contributes each bar, not the box around all of them.
+fn path_rects(path: &anicraft_engine::geom::Path, xf: anicraft_engine::geom::Affine) -> Vec<(i32, i32, i32, i32)> {
+    use anicraft_engine::geom::{PathCmd, Vec2};
+    let mut out = Vec::new();
+    let mut pts: Vec<Vec2> = Vec::new();
+    let mut curved = false;
+    let flush = |pts: &mut Vec<Vec2>, curved: &mut bool, out: &mut Vec<(i32, i32, i32, i32)>| {
+        if !*curved && pts.len() == 4 {
+            let (mut x0, mut y0, mut x1, mut y1) = (f32::MAX, f32::MAX, f32::MIN, f32::MIN);
+            for p in pts.iter() {
+                x0 = x0.min(p.x);
+                y0 = y0.min(p.y);
+                x1 = x1.max(p.x);
+                y1 = y1.max(p.y);
+            }
+            let aligned = pts.iter().all(|p| (p.x == x0 || p.x == x1) && (p.y == y0 || p.y == y1));
+            if aligned && x1 > x0 && y1 > y0 {
+                let corners = [Vec2::new(x0, y0), Vec2::new(x1, y0), Vec2::new(x0, y1), Vec2::new(x1, y1)];
+                let mut sx0 = f32::MAX;
+                let mut sy0 = f32::MAX;
+                let mut sx1 = f32::MIN;
+                let mut sy1 = f32::MIN;
+                let mut finite = true;
+                for c in corners {
+                    let q = xf.apply(c);
+                    if !q.x.is_finite() || !q.y.is_finite() {
+                        finite = false;
+                        break;
+                    }
+                    sx0 = sx0.min(q.x);
+                    sy0 = sy0.min(q.y);
+                    sx1 = sx1.max(q.x);
+                    sy1 = sy1.max(q.y);
+                }
+                if finite {
+                    out.push((sx0.floor() as i32, sy0.floor() as i32, sx1.ceil() as i32, sy1.ceil() as i32));
+                }
+            }
+        }
+        pts.clear();
+        *curved = false;
+    };
+    for cmd in &path.cmds {
+        match *cmd {
+            PathCmd::MoveTo(p) => {
+                flush(&mut pts, &mut curved, &mut out);
+                pts.push(p);
+            }
+            PathCmd::LineTo(p) => pts.push(p),
+            PathCmd::Close => flush(&mut pts, &mut curved, &mut out),
+            PathCmd::QuadTo(_, _) | PathCmd::CubicTo(_, _, _) => curved = true,
+        }
+    }
+    flush(&mut pts, &mut curved, &mut out);
+    out
+}
+
+/// Multiply shapes drawn above the top raster plate. The 2kool grid is these.
+fn multiply_above(pic: &anicraft_engine::editing::StagePicture) -> Vec<Wash> {
+    use anicraft_engine::doc::{BlendMode, LayerKind, Paint};
+    let (scene, local) = pic.doc.locate(pic.frame);
+    let tl = pic.doc.timeline(scene);
+    let Some(top) = tl.layers.iter().position(|l| l.visible && l.kind == LayerKind::Raster && l.keyframe_at(local).and_then(|k| k.plate.as_ref()).is_some_and(|p| p.is_ok())) else {
+        return Vec::new();
+    };
+    if top == 0 {
+        return Vec::new();
+    }
+    let above: Vec<_> = tl.layers[..top].iter().filter(|l| l.visible).map(|l| l.id).collect();
+    if above.is_empty() {
+        return Vec::new();
+    }
+    let dl = anicraft_engine::doc::evaluate_scene(&pic.doc, scene, local);
+    let mut washes = Vec::new();
+    for item in &dl.items {
+        if item.guide || item.masks.is_some() || !above.contains(&item.layer) {
+            continue;
+        }
+        let Some(gid) = item.group else { continue };
+        let Some(group) = dl.groups.get(gid as usize) else { continue };
+        if group.blend != BlendMode::Multiply || !group.filters.is_empty() {
+            continue;
+        }
+        let mut alpha = group.alpha;
+        let mut parent = group.parent;
+        let mut plain = true;
+        while let Some(id) = parent {
+            let Some(pg) = dl.groups.get(id as usize) else {
+                plain = false;
+                break;
+            };
+            if !matches!(pg.blend, BlendMode::Normal | BlendMode::Layer) || !pg.filters.is_empty() {
+                plain = false;
+                break;
+            }
+            alpha *= pg.alpha;
+            parent = pg.parent;
+        }
+        if !plain || !(alpha > 0.0) {
+            continue;
+        }
+        let Some(Paint::Solid(fill)) = item.fill.as_ref() else { continue };
+        let c = item.color.apply(*fill);
+        for (x0, y0, x1, y1) in path_rects(&item.path, item.transform) {
+            if x1 > x0 && y1 > y0 {
+                washes.push(Wash { x0, y0, x1, y1, rgba: [c.r, c.g, c.b, c.a], group: gid, group_alpha: alpha });
+            }
+        }
+    }
+    washes
+}
+
+fn plate_rows(plate: &anicraft_engine::doc::RasterPlate, y0: u32, y1: u32) -> Option<Vec<u8>> {
+    let width = plate.width();
+    let stride = (width as usize).saturating_mul(4);
+    let rows = y1.saturating_sub(y0) as usize;
+    if stride == 0 || rows == 0 || y1 > plate.height() {
+        return None;
+    }
+    let mut out = vec![0u8; stride.saturating_mul(rows)];
+    for (i, y) in (y0..y1).enumerate() {
+        let src = plate.row(y)?;
+        if src.len() != stride {
+            return None;
+        }
+        let start = i.saturating_mul(stride);
+        let dst = out.get_mut(start..start + stride)?;
+        dst.copy_from_slice(src);
+    }
+    Some(out)
+}
+
+/// The plate's egui texture. An existing texture is patched in place, and only the rows the
+/// live view has not shown yet, so a long stroke does not replace the whole stage every move.
+fn plate_texture(cache: &mut Vec<PlateTex>, ctx: &egui::Context, plate: &anicraft_engine::doc::RasterPlate, washes: &[Wash], paper: [f32; 3]) -> Option<egui::TextureId> {
+    let draw = plate.preview();
+    let (w, h) = (plate.width(), plate.height());
+    if w == 0 || h == 0 || w > 16384 || h > 16384 {
+        return None;
+    }
+    let options = egui::TextureOptions::NEAREST;
+    let upload = |bytes: &mut [u8], y0: u32| {
+        shade_rows(bytes, w, y0, washes, paper);
+    };
+    if let Some(slot) = cache.iter_mut().find(|t| t.stamp == draw.stamp && t.width == w && t.height == h) {
+        if slot.generation == draw.generation {
+            return Some(slot.tex.id());
+        }
+        let (y0, y1) = if draw.generation > slot.generation && draw.y1 > draw.y0 && draw.y1 <= h { (draw.y0, draw.y1) } else { (0, h) };
+        let Some(mut bytes) = plate_rows(plate, y0, y1) else {
+            return Some(slot.tex.id());
+        };
+        upload(&mut bytes, y0);
+        let patch = egui::ColorImage::from_rgba_unmultiplied([w as usize, (y1 - y0) as usize], &bytes);
+        let id = slot.tex.id();
+        ctx.tex_manager().write().set(id, egui::epaint::ImageDelta::partial([0, y0 as usize], patch, options));
+        slot.generation = draw.generation;
+        anicraft_engine::doc::preview_catch_up(draw.stamp, draw.generation);
+        return Some(id);
+    }
+    let Some(mut bytes) = plate_rows(plate, 0, h) else {
+        return None;
+    };
+    upload(&mut bytes, 0);
+    let tex = ctx.load_texture(format!("raster-plate-{}", draw.stamp), egui::ColorImage::from_rgba_unmultiplied([w as usize, h as usize], &bytes), options);
+    let id = tex.id();
+    cache.push(PlateTex { stamp: draw.stamp, generation: draw.generation, width: w, height: h, tex });
+    anicraft_engine::doc::preview_catch_up(draw.stamp, draw.generation);
+    Some(id)
+}
+
+/// Raster plates of the picture, back to front, in stage space.
+fn paint_live_plates(app: &mut App, painter: &egui::Painter, pic: &anicraft_engine::editing::StagePicture, st_screen: &impl Fn(Vec2) -> Pos2, pivot: Pos2, pan: egui::Vec2, rotation: f32, washes: &[Wash], paper: [f32; 3]) {
+    let (scene, local) = pic.doc.locate(pic.frame);
+    let tl = pic.doc.timeline(scene);
+    let uv = Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0));
+    for layer in tl.layers.iter().rev() {
+        if !layer.visible || layer.kind != anicraft_engine::doc::LayerKind::Raster {
+            continue;
+        }
+        let Some(plate) = layer.keyframe_at(local).and_then(|k| k.plate.as_ref()).filter(|p| p.is_ok()) else { continue };
+        let Some(id) = plate_texture(&mut app.stage_cache.plate_tex, painter.ctx(), plate, washes, paper) else { continue };
+        let (w, h) = (plate.width() as f32, plate.height() as f32);
+        let upright = [st_screen(Vec2::new(0.0, 0.0)), st_screen(Vec2::new(w, 0.0)), st_screen(Vec2::new(w, h)), st_screen(Vec2::new(0.0, h))];
+        paint_tile(painter, id, upright, uv, pivot, pan, rotation);
+    }
+}
+
 /// One stage tile. Upright it is the axis-aligned image; turned, the same corners after the view turn.
-fn paint_tile(painter: &egui::Painter, tex: egui::TextureId, upright: [Pos2; 4], uv: Rect, pivot: Pos2, pan: egui::Vec2, rotation: f32) {
+pub(crate) fn paint_tile(painter: &egui::Painter, tex: egui::TextureId, upright: [Pos2; 4], uv: Rect, pivot: Pos2, pan: egui::Vec2, rotation: f32) {
     if rotation == 0.0 {
         painter.image(tex, Rect::from_min_max(upright[0], upright[2]), uv, Color32::WHITE);
         return;
@@ -524,6 +885,7 @@ pub fn show(app: &mut App, ui: &mut egui::Ui) {
             _ if matches!(app.drag, Drag::Hint { .. } | Drag::CameraPan { .. } | Drag::BonePose { .. } | Drag::WarpPin { .. }) => CursorIcon::Grabbing,
             _ if matches!(app.drag, Drag::ArmatureMove { .. }) => CursorIcon::Move,
             Tool::Select if app.drag == Drag::None && pointer.is_some_and(|p| crate::bone_tool::hit(app, xf, p).is_some()) => CursorIcon::Grab,
+            Tool::Select if app.drag == Drag::None && pointer.is_some_and(|p| app.s.raster_hot(to_v(to_stage(p)))) => CursorIcon::Grab,
             _ if paused => CursorIcon::NotAllowed,
             Tool::Camera if app.drag == Drag::None && pointer.is_some_and(|p| crate::camera_tool::on_knob(app, &cam_geo, p)) => CursorIcon::Alias,
             Tool::Camera => CursorIcon::Grab,
@@ -548,10 +910,11 @@ pub fn show(app: &mut App, ui: &mut egui::Ui) {
                     Some(XfKind::Scale { .. }) => CursorIcon::ResizeHorizontal,
                     Some(XfKind::Rotate) => CursorIcon::Alias,
                     Some(XfKind::Move) => CursorIcon::Move,
+                    None if pointer.is_some_and(|p| app.s.raster_hot(to_v(to_stage(p)))) => CursorIcon::Grab,
                     None => CursorIcon::Default,
                 }
             }
-            Tool::Rect | Tool::Oval | Tool::Star | Tool::Line | Tool::Pen | Tool::Pencil | Tool::Brush | Tool::PaintBrush | Tool::Eraser | Tool::PaintBucket | Tool::InkBottle | Tool::Eyedropper | Tool::Bone | Tool::Bind | Tool::Warp => CursorIcon::Crosshair,
+            Tool::Rect | Tool::Oval | Tool::Star | Tool::Line | Tool::Pen | Tool::Pencil | Tool::Brush | Tool::PaintBrush | Tool::Eraser | Tool::PaintBucket | Tool::InkBottle | Tool::Eyedropper | Tool::Bone | Tool::Bind | Tool::Warp | Tool::Pixel => CursorIcon::Crosshair,
             Tool::Text => CursorIcon::Text,
             Tool::Zoom => {
                 if alt {
@@ -642,8 +1005,9 @@ pub fn show(app: &mut App, ui: &mut egui::Ui) {
                             app.s.begin_gesture(tr_noop!("Free Transform"));
                             Drag::Transform { kind, start: sp, bounds, applied: Affine::IDENTITY }
                         }
-                        // Not on the box: grab whatever is under the pointer and move it.
-                        _ => match app.s.hit_test(to_v(sp), 3.0 / zoom) {
+                        // Not on the box: grab whatever is under the pointer and move it. A plate
+                        // pixel counts: the hit test skips the stage-sized plate rectangle.
+                        _ => match app.s.stage_hit(to_v(sp)) {
                             Some(_) => {
                                 app.run("element.pick", json!({"x": sp.x, "y": sp.y, "add": shift}));
                                 match bounds_arr(app.s.selection_bounds()) {
@@ -669,6 +1033,7 @@ pub fn show(app: &mut App, ui: &mut egui::Ui) {
                     Drag::Pencil
                 }
                 Tool::Brush | Tool::PaintBrush => crate::brushtool::start(app, to_v(sp), pressure, now),
+                Tool::Pixel => crate::pixeltool::begin(app, to_v(sp), pressure),
                 // With the Faucet on, the eraser deletes on a click instead.
                 Tool::Eraser if !app.eraser.faucet => crate::erasertool::start(app, to_v(sp)),
                 Tool::Pen | Tool::Text | Tool::PaintBucket | Tool::InkBottle | Tool::Eyedropper | Tool::Eraser => Drag::None,
@@ -840,6 +1205,10 @@ pub fn show(app: &mut App, ui: &mut egui::Ui) {
             (Drag::Pencil, Some(c)) => crate::pathtools::pencil_sample(app, to_v(c), xf),
             (Drag::Brush, Some(c)) => crate::brushtool::sample(app, to_v(c), pressure, xf, now),
             (Drag::Eraser, Some(c)) => crate::brushtool::sample(app, to_v(c), None, xf, now),
+            (Drag::Pixel { x, y, pressure: was, .. }, Some(c)) => {
+                let from = (*x, *y, *was);
+                crate::pixeltool::move_to(app, from, c, pressure);
+            }
             (Drag::Marquee { cur: m, .. }, Some(c)) => *m = c,
             (Drag::Shape { start, cur: m }, Some(c)) => *m = constrain(app.tool, *start, c, shift),
             _ => {}
@@ -875,6 +1244,7 @@ pub fn show(app: &mut App, ui: &mut egui::Ui) {
                 app.run("raw.select_rect", json!({"x0": start.x, "y0": start.y, "x1": cur.x, "y1": cur.y, "add": shift}));
             }
             Drag::Shape { start, cur } => create_shape(app, start, cur),
+            Drag::Pixel { .. } => crate::pixeltool::finish(app),
             Drag::Pan | Drag::None | Drag::ViewRotate { .. } | Drag::ViewZoom { .. } | Drag::CameraWheel { .. } => {}
         }
         app.drag = Drag::None;
@@ -923,6 +1293,7 @@ pub fn show(app: &mut App, ui: &mut egui::Ui) {
                     crate::brushtool::start(app, to_v(sp), pressure, now);
                     crate::brushtool::commit(app, xf);
                 }
+                Tool::Pixel if !panning => crate::pixeltool::tap(app, to_v(sp), pressure),
                 Tool::Eraser if !panning => {
                     if app.eraser.faucet {
                         crate::erasertool::faucet(app, to_v(sp), zoom);
@@ -1029,7 +1400,7 @@ pub fn show(app: &mut App, ui: &mut egui::Ui) {
             crate::onion::context_menu(app, ui);
             return;
         }
-        if app.s.selection.is_empty() {
+        if app.s.selection.is_empty() && app.s.raster_pick().is_none() {
             for id in ["edit.paste", "edit.paste_in_place", "edit.select_all", "timeline.insert_keyframe", "timeline.insert_blank_keyframe"] {
                 crate::menus::cmd_item(app, ui, id);
             }
@@ -1128,11 +1499,25 @@ pub fn show(app: &mut App, ui: &mut egui::Ui) {
         let onion = crate::onion::stage_skin(app).copied();
         let onion = onion.as_ref();
         let state = pic.state;
+        // A raster drag keeps the scene tiles from before the stroke (no plate) and draws the
+        // plate itself, so the line is on screen this frame instead of whenever a tile finishes.
+        let painting = !preview && matches!(app.drag, Drag::Pixel { .. });
+        if painting {
+            app.stage_cache.plate_hold = true;
+        }
+        let mut stripped = None;
+        if let Some(base) = painting.then(|| app.s.gesture_base_state()).flatten() {
+            let mut doc = pic.doc.clone();
+            hide_raster_plates(&mut doc);
+            stripped = Some((plate_live_state(base), doc));
+        }
+        let job_state = stripped.as_ref().map(|(s, _)| *s).unwrap_or(state);
+        let job_doc = stripped.as_ref().map(|(_, doc)| doc).unwrap_or(&pic.doc);
         // Render jobs take movie frames: the current scene starts at `start`.
         let start = app.s.doc.scene_start(app.s.scene);
         let frame = app.s.frame;
         // Inside a symbol open in place, onion skin composes the symbol's own frames (ADR 0051).
-        let jobs: Vec<(TileSpec, FrameJob)> = visible.into_iter().map(|t| { let j = make_job_for(raster, state, &pic.doc, pic.frame, t.view, onion).through_camera(preview).inside(pic.front.clone()); (t, j) }).collect();
+        let jobs: Vec<(TileSpec, FrameJob)> = visible.into_iter().map(|t| { let j = make_job_for(raster, job_state, job_doc, pic.frame, t.view, onion).through_camera(preview).inside(pic.front.clone()); (t, j) }).collect();
         let keys: Vec<u64> = jobs.iter().map(|(_, j)| j.key).collect();
         let missing: Vec<usize> = (0..jobs.len()).filter(|&i| !app.stage_cache.has(keys[i])).collect();
 
@@ -1145,13 +1530,16 @@ pub fn show(app: &mut App, ui: &mut egui::Ui) {
             // background worker as one batch; older tiles cover the gap meanwhile.
             // The very first picture has nothing older to stand in for it, so it counts too.
             let edited = app.stage_cache.shown_state != Some(state);
-            let immediate = !app.playing
-                && edited
-                && match app.prefs.render_mode {
-                    RenderMode::Immediate => true,
-                    RenderMode::Background => false,
-                    RenderMode::Auto => app.stage_cache.ms <= IMMEDIATE_BUDGET_MS,
-                };
+            // The stripped scene has no plate, so it is cheap, and it has to land before the
+            // live plate is drawn or the old plate would show twice.
+            let immediate = painting
+                || (!app.playing
+                    && edited
+                    && match app.prefs.render_mode {
+                        RenderMode::Immediate => true,
+                        RenderMode::Background => false,
+                        RenderMode::Auto => app.stage_cache.ms <= IMMEDIATE_BUDGET_MS,
+                    });
             let batch: Vec<FrameJob> = missing.iter().map(|&i| jobs[i].1.clone()).collect();
             let started = web_time::Instant::now();
             let results: Vec<Option<std::sync::Arc<FrameImage>>> = if immediate { svc.render_now_batch(batch).into_iter().map(Some).collect() } else { svc.request_batch(batch) };
@@ -1186,12 +1574,14 @@ pub fn show(app: &mut App, ui: &mut egui::Ui) {
         let ready = keys.iter().filter(|k| app.stage_cache.tiles.iter().any(|t| t.key == **k)).count();
         app.stage_cache.ready = (ready, keys.len());
         if ready == keys.len() {
-            app.stage_cache.shown_state = Some(state);
+            app.stage_cache.shown_state = Some(if stripped.is_some() { job_state } else { state });
         }
 
-        // Look-ahead: the ring of tiles around the view (a pan reveals them instantly) and,
-        // during playback, the next frames' visible tiles.
-        if let Some(svc) = &app.stage_cache.service {
+        // Look-ahead of the live document would render the plate on the worker and replace
+        // the stroke. The tiles stay as they were until the pen comes up.
+        if stripped.is_none()
+            && let Some(svc) = &app.stage_cache.service
+        {
             let mut ahead: Vec<FrameJob> = Vec::new();
             if app.playing && !editing {
                 let n = app.s.frame_count().max(1);
@@ -1222,7 +1612,20 @@ pub fn show(app: &mut App, ui: &mut egui::Ui) {
             let upright = [st_screen(Vec2::new(t.rect[0], t.rect[1])), st_screen(Vec2::new(t.rect[2], t.rect[1])), st_screen(Vec2::new(t.rect[2], t.rect[3])), st_screen(Vec2::new(t.rect[0], t.rect[3]))];
             paint_tile(&painter, t.tex.id(), upright, uv, pivot, pan, rotation);
         }
-
+        // The plate sits on the tiles from before the stroke. Once the real tiles (with the
+        // plate baked in) are the ones on screen, this stops so the ink is not drawn twice.
+        // Multiply artwork above the ink (the 2kool grid) is baked into the ink pixels, so the
+        // lines stay on the stroke instead of popping back when the tiles catch up.
+        let caught_up = !painting && ready == keys.len() && app.stage_cache.shown_state == Some(state);
+        if app.stage_cache.plate_hold && !caught_up {
+            let bg = app.s.doc.stage.background;
+            let washes = multiply_above(&pic);
+            paint_live_plates(app, &painter, &pic, &st_screen, pivot, pan, rotation, &washes, [bg.r, bg.g, bg.b]);
+        }
+        if caught_up {
+            app.stage_cache.plate_hold = false;
+            app.stage_cache.plate_tex.clear();
+        }
         // While a background render catches up with a drag, outline where the selection is now,
         // so the artwork never seems to lag the pointer.
         if ready < keys.len() && !preview && matches!(app.drag, Drag::Move { .. } | Drag::SnapMove { .. } | Drag::Transform { .. } | Drag::Bend { .. } | Drag::RawPoint { .. } | Drag::RawHandle { .. }) {
@@ -1369,6 +1772,14 @@ pub fn show(app: &mut App, ui: &mut egui::Ui) {
         // registration point
         let o = to_screen(e.transform.translation());
         painter.circle(o, 3.5, Color32::WHITE, Stroke::new(1.0, Color32::BLACK));
+    }
+    // The crop is not an element. Free Transform draws one box from the selection bounds,
+    // which already includes it, so this box is only for the Selection tool (ADR 0115).
+    if app.tool == Tool::Select && !transforming
+        && let Some(pick) = app.s.raster_pick()
+    {
+        let b = pick.rect;
+        stroke_box(&painter, Vec2::new(b.x as f32, b.y as f32), Vec2::new(b.x as f32 + b.w as f32, b.y as f32 + b.h as f32), &to_screen, sel_stroke, turned, 1.0);
     }
     // Free transform box: recomputed every frame so it follows the artwork while you drag.
     let xf_box = if multi { crate::onion::selection_bounds(app) } else { bounds_arr(app.s.selection_bounds()) };
@@ -1622,6 +2033,26 @@ fn move_raw_point(app: &mut App, c: Pos2, zoom: f32) {
 /// is) and moved. With `corner` (Ctrl, ⌘ on macOS), as in Animate, an edge gets a corner point
 /// where it was pressed and the drag pulls that point, so the edge peaks there (#200).
 fn select_press(app: &mut App, sp: Pos2, shift: bool, corner: bool, copy: bool, zoom: f32) -> Drag {
+    // A plate is drawn over that layer's vectors, and the raw grab skips plates. Ink wins.
+    if let Some(anicraft_engine::StageHit::Raster(_)) = app.s.stage_hit(to_v(sp)) {
+        let was = app.s.raster_pick().is_some_and(|p| p.rect.contains_stage(sp.x, sp.y));
+        app.run("element.pick", json!({"x": sp.x, "y": sp.y, "add": shift}));
+        let held = app.s.raster_pick().map(|p| p.rect).filter(|r| r.contains_stage(sp.x, sp.y));
+        // Shift on a crop that was already the whole plate lets it go. Fall through.
+        if !(was && shift && held.is_none())
+            && let Some(rect) = held
+        {
+            let (w, h) = (rect.w, rect.h);
+            app.status_ok(tr!("Pixel crop {w}×{h}. Drag to move it. Convert to Symbol makes a movie clip.", w = w, h = h));
+            if copy {
+                app.s.begin_gesture(tr_noop!("Copy"));
+                app.run("edit.duplicate", json!({"dx": 0, "dy": 0}));
+            } else {
+                app.s.begin_gesture(tr_noop!("Move"));
+            }
+            return Drag::SnapMove { start: sp, applied: egui::Vec2::ZERO };
+        }
+    }
     let point_drag = |app: &mut App, at: Vec2| {
         app.raw_points = serde_json::Value::Null;
         app.raw_with.clear();
@@ -1971,6 +2402,7 @@ mod pattern_tests {
             image: None,
             smooth: true,
             warp: None,
+            plate: None,
         }
     }
 
@@ -2507,5 +2939,51 @@ mod pasteboard_tests {
         assert!(n <= (2 * MAX_TILES_PER_AXIS + 1).pow(2), "{n} tiles");
         // Clipped and looking away from the stage: nothing to draw.
         assert!(tiles_for(1.0, (100, 100), [-900.0, -900.0, -10.0, -10.0], 0, Some(BG), false).is_empty());
+    }
+}
+
+#[cfg(test)]
+mod live_plate_tests {
+    use super::*;
+    use anicraft_engine::doc::{Document, Layer, LayerId, LayerKind, RasterPlate, Rgba};
+    use anicraft_engine::editing::StagePicture;
+    use std::sync::Arc;
+
+    fn blue(alpha: f32) -> Wash {
+        Wash { x0: 0, y0: 0, x1: 2, y1: 1, rgba: [44.0 / 255.0, 176.0 / 255.0, 1.0, alpha], group: 0, group_alpha: 0.15 }
+    }
+
+    #[test]
+    fn multiply_stays_on_the_ink_and_clear_pixels_stay_clear() {
+        let paper = [1.0, 1.0, 1.0];
+        let mut row = vec![0, 0, 0, 0, 255, 255, 255, 255, 0, 0, 0, 255, 9, 9, 9, 255];
+        let mut line = blue(1.0);
+        line.x1 = 3;
+        shade_row(&mut row, 0, paper, &[line]);
+        assert_eq!(&row[0..4], &[0, 0, 0, 0], "a clear pixel leaves the tile's grid alone");
+        assert_eq!(&row[4..8], &[223, 243, 255, 255], "white ink takes the multiply");
+        assert_eq!(&row[8..12], &[0, 0, 0, 255], "black ink stays black under multiply");
+        assert_eq!(&row[12..16], &[9, 9, 9, 255], "outside the line the plate is unchanged");
+    }
+
+    #[test]
+    fn the_2kool_grid_is_one_wash_per_bar_above_the_raster_plate() {
+        let mut doc = Document::default();
+        doc.stage.width = 3840;
+        doc.stage.height = 3840;
+        doc.stage.background = Rgba::new(1.0, 1.0, 1.0, 1.0);
+        anicraft_engine::doc::koolgrid::place(&mut doc).expect("grid");
+        let mut layer = Layer::new(LayerId(doc.alloc_id()), "Raster 1");
+        layer.kind = LayerKind::Raster;
+        let plate = RasterPlate::transparent(4, 4).expect("plate");
+        layer.keyframe_mut(0).expect("key").plate = Some(plate);
+        doc.timeline_mut(0).layers.insert(1, Arc::new(layer));
+        let pic = StagePicture { doc, frame: 0, state: 0, front: None };
+        let washes = multiply_above(&pic);
+        assert_eq!(washes.len(), 26, "each grid bar, not the box around all of them");
+        assert!(washes.iter().all(|w| (w.group_alpha - 0.15).abs() < 1e-4));
+        let covers = |x: i32, y: i32| washes.iter().any(|w| x >= w.x0 && x < w.x1 && y >= w.y0 && y < w.y1);
+        assert!(covers(1920, 1920), "a solid bar");
+        assert!(!covers(10, 10), "the margin is not a bar");
     }
 }

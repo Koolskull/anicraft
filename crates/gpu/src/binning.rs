@@ -34,7 +34,7 @@
 //! distinct image; a filtered group's layer is drawn and filtered by the GPU before the pass and
 //! copied into the paint buffer after the gradient tables, where its fill reads it.
 
-use anicraft_doc::{BlendMode, Pixels};
+use anicraft_doc::{BlendMode, Pixels, PlateDraw};
 use anicraft_geom::{FillRule, Vec2};
 use anicraft_render::paint::Shader;
 use anicraft_render::{Fill, NeedsFull, Scene};
@@ -126,6 +126,12 @@ pub fn blend_code(m: BlendMode) -> u32 {
     }
 }
 
+/// One bitmap the fine pass samples. A plate keeps its texture identity beside the bytes.
+pub struct GpuImage {
+    pub pixels: Arc<Pixels>,
+    pub plate: Option<PlateDraw>,
+}
+
 /// A scene ready for the fine shader.
 ///
 /// * `index` (u32): `[start, count]` per tile into the entry list; then each entry as
@@ -155,7 +161,7 @@ pub struct Binned {
     /// shows it (then it isn't drawn).
     pub layer_at: Vec<Option<u32>>,
     /// The bitmaps, in texture-slot order.
-    pub images: Vec<Arc<Pixels>>,
+    pub images: Vec<GpuImage>,
     /// Entries (fills, artwork and control) and edge pieces in all tiles.
     pub entries: usize,
     pub pieces: usize,
@@ -262,7 +268,7 @@ pub fn bin_with(scene: &Scene, width: u32, height: u32, gpu: Option<&crate::gpu_
     // Paints: a fixed record per op, then the gradient tables, then the layers' pixels.
     let mut paints: Vec<[f32; 4]> = Vec::with_capacity(PAINT_VEC4S * ops.len());
     let mut ramps: Vec<[f32; 4]> = Vec::new();
-    let mut images: Vec<Arc<Pixels>> = Vec::new();
+    let mut images: Vec<GpuImage> = Vec::new();
     let ramps_at = (PAINT_VEC4S * ops.len()) as u32;
     // Where each layer shown by a fill goes, after the tables (the tables' size is known first).
     // Gradients' ramps, and each bitmap's colour transform (two entries).
@@ -317,17 +323,32 @@ pub fn bin_with(scene: &Scene, width: u32, height: u32, gpu: Option<&crate::gpu_
                 (RADIAL, [[spread_code(*spread), *focal, 0.0, 0.0], [m[0], m[1], m[2], m[3]], [m[4], m[5], center.x, center.y], [0.0, 0.0, *inv_radius, 0.0]])
             }
             // The oracle's sample of a bitmap (crates/render/src/paint.rs › sample).
-            (Shader::Bitmap { inv, pixels, repeat, fx, smooth }, _) => {
+            (Shader::Bitmap { inv, pixels, repeat, fx, smooth, plate }, _) => {
                 if pixels.width == 0 || pixels.height == 0 {
                     (SOLID, [[0.0; 4]; 4])
                 } else {
-                    let slot = match images.iter().position(|p| Arc::ptr_eq(p, pixels)) {
-                        Some(i) => i,
-                        None if images.len() < MAX_IMAGES => {
-                            images.push(pixels.clone());
-                            images.len() - 1
-                        }
-                        None => return Err(NeedsFull::Bitmaps),
+                    let slot = match plate {
+                        Some(draw) => match images.iter().position(|p| p.plate.is_some_and(|d| d.stamp == draw.stamp)) {
+                            Some(i) => {
+                                if images.get(i).is_some_and(|p| p.plate.is_some_and(|d| draw.generation >= d.generation)) {
+                                    images[i] = GpuImage { pixels: pixels.clone(), plate: Some(*draw) };
+                                }
+                                i
+                            }
+                            None if images.len() < MAX_IMAGES => {
+                                images.push(GpuImage { pixels: pixels.clone(), plate: Some(*draw) });
+                                images.len() - 1
+                            }
+                            None => return Err(NeedsFull::Bitmaps),
+                        },
+                        None => match images.iter().position(|p| p.plate.is_none() && Arc::ptr_eq(&p.pixels, pixels)) {
+                            Some(i) => i,
+                            None if images.len() < MAX_IMAGES => {
+                                images.push(GpuImage { pixels: pixels.clone(), plate: None });
+                                images.len() - 1
+                            }
+                            None => return Err(NeedsFull::Bitmaps),
+                        },
                     };
                     let m = inv.m;
                     // The colour transform (ADR 0056) rides in the ramp table: multiplies, then

@@ -30,6 +30,8 @@ pub mod cmds_paint;
 mod cmds_path;
 pub mod cmds_raw;
 pub mod cmds_rawsub;
+mod cmds_raster;
+mod raster_crop;
 mod cmds_rawpoints;
 pub mod brush_library;
 pub mod filter_library;
@@ -82,6 +84,7 @@ pub use anicraft_render as render;
 /// Whether a path is an Animate document (`.fla`, `.xfl`, or an XFL folder) that `file.open`
 /// imports.
 pub use cmds_file::is_animate;
+pub use raster_crop::{RasterPick, StageHit};
 
 #[derive(Debug, thiserror::Error)]
 pub enum EngineError {
@@ -172,6 +175,7 @@ pub fn commands() -> Vec<CommandSpec> {
     v.extend(cmds_filter::specs());
     v.extend(cmds_erase::specs());
     v.extend(cmds_paint::specs());
+    v.extend(cmds_raster::specs());
     v.extend(cmds_swatch::specs());
     v.extend(cmds_text::specs());
     v.extend(cmds_width::specs());
@@ -356,6 +360,15 @@ pub struct Session {
     pub(crate) pending_cut: Option<(CutOrigin, Vec<ElementId>)>,
     /// The open gesture began on a provisional cut: the document with the cut.
     gesture_cut: Option<Document>,
+    /// Coverage of the raster stroke in the open gesture. Cleared when the gesture ends,
+    /// so the fill's alpha is applied once for the whole drag (ADR 0113).
+    pub(crate) raster_cover: Option<cmds_raster::RasterCover>,
+    /// The raster crop the Selection tool is holding (ADR 0115). Like the element selection,
+    /// it is session state: a marquee that only picks pixels records no undo step. A move of
+    /// it does, and undo puts this box back with the pixels.
+    pub(crate) raster_pick: Option<raster_crop::RasterPick>,
+    /// The picture lifted for the open drag. Not in an undo snapshot: the plate is.
+    pub(crate) raster_lift: Option<raster_crop::Lift>,
     /// How a button open for editing shows its hit area over its other states (ADR 0057): the
     /// tint and opacity, or `None` for no overlay (the default; the app sets it from its theme).
     /// View state, like the playhead: never in the document or its undo history.
@@ -446,6 +459,9 @@ impl Session {
             provisional: None,
             pending_cut: None,
             gesture_cut: None,
+            raster_cover: None,
+            raster_pick: None,
+            raster_lift: None,
             hit_area: None,
             picture_cache: RefCell::new(None),
             job: None,
@@ -495,6 +511,7 @@ impl Session {
         if self.gesture.is_some() {
             return;
         }
+        self.raster_cover = None;
         // On a marquee's cut, the step (if the gesture makes one) starts from before the cut.
         let cut = self.live_cut().map(|p| (history::Snapshot { label: label.to_string(), ..p.before.clone() }, p.cut.clone()));
         match cut {
@@ -508,6 +525,11 @@ impl Session {
 
     /// Ends the open gesture, recording one undo step if the document changed.
     pub fn end_gesture(&mut self) {
+        self.raster_cover = None;
+        // The drag resamples one lifted picture. Drop it, then tighten the box, before the
+        // step is taken. Releasing with no open gesture still tightens a crop.
+        self.raster_lift = None;
+        raster_crop::shrink(self);
         let cut = self.gesture_cut.take();
         let Some(before) = self.gesture.take() else { return };
         if let Some(cut) = &cut {
@@ -527,6 +549,19 @@ impl Session {
 
     pub fn in_gesture(&self) -> bool {
         self.gesture.is_some()
+    }
+
+    /// Document state from before the open gesture. Stable for the whole drag.
+    pub fn gesture_base_state(&self) -> Option<StateId> {
+        self.gesture.as_ref().map(|g| g.state)
+    }
+
+    /// The active plate as it was when the open gesture began. A layer created by this
+    /// stroke is absent, which is an empty plate.
+    pub(crate) fn pre_stroke_plate(&self) -> Option<&anicraft_doc::RasterPlate> {
+        let snap = self.gesture.as_ref()?;
+        let timeline = crate::editing::edited(&snap.doc, self.scene, &self.editing);
+        timeline.layer(self.layer)?.keyframe_at(self.frame)?.plate.as_ref()
     }
 
     /// Replaces the document (new/open), clearing history.
@@ -575,6 +610,34 @@ impl Session {
             self.settle_cut(id, params);
             self.hold_group_frame();
             return r;
+        }
+        // A pixel drag would otherwise snapshot and compare the whole plate on every move
+        // (ADR 0113). The gesture already holds the pre-stroke rows. An error drops the
+        // stroke so far; end_gesture then records nothing.
+        if self.gesture.is_some() && self.gesture_cut.is_none() && id == "paint.raster" {
+            self.dl_cache.replace(None);
+            self.pending_cut = None;
+            self.motion_edit = None;
+            self.step_label = None;
+            let result = (spec.run)(self, params);
+            self.dl_cache.replace(None);
+            self.pending_cut = None;
+            self.motion_edit = None;
+            let _ = self.step_label.take();
+            return match result {
+                Ok(v) => {
+                    self.state = history::fresh_state();
+                    self.revision += 1;
+                    self.fix_selection();
+                    self.hold_group_frame();
+                    Ok(v)
+                }
+                Err(e) => {
+                    self.restore_open_gesture();
+                    self.revision += 1;
+                    Err(e)
+                }
+            };
         }
         // An edit on a marquee's cut records its step from before the cut (ADR 0041).
         let cut = self.live_cut().map(|p| (history::Snapshot { label: spec.label.to_string(), ..p.before.clone() }, p.cut.clone()));
@@ -744,22 +807,32 @@ impl Session {
     /// Puts the document back where the open gesture started, keeping the gesture open. A
     /// live preview re-runs from the same start on every change, and Cancel leaves no step.
     pub fn revert_gesture(&mut self) {
+        // Cancel throws the lifted picture away. The plate comes back from the snapshot.
+        self.raster_lift = None;
         if self.gesture_cut.is_some() {
             // Back to before the marquee's cut: it is gone.
             self.provisional = None;
         }
         let Some(g) = &self.gesture else { return };
-        if g.doc == self.doc && g.selection == self.selection {
+        if g.doc == self.doc && g.selection == self.selection && g.raster_pick == self.raster_pick {
             return;
         }
-        let back = Snapshot { label: String::new(), doc: g.doc.clone(), state: g.state, scene: g.scene, editing: g.editing.clone(), frame: g.frame, layer: g.layer, selection: g.selection.clone(), bytes: 0 };
+        let back = Snapshot { label: String::new(), doc: g.doc.clone(), state: g.state, scene: g.scene, editing: g.editing.clone(), frame: g.frame, layer: g.layer, selection: g.selection.clone(), raster_pick: g.raster_pick, bytes: 0 };
         self.restore(back);
         self.revision += 1;
         self.fix_selection();
     }
 
+    /// Puts the document back where the open gesture started, and leaves the gesture open.
+    fn restore_open_gesture(&mut self) {
+        self.raster_cover = None;
+        let Some(g) = &self.gesture else { return };
+        let back = Snapshot { label: String::new(), doc: g.doc.clone(), state: g.state, scene: g.scene, editing: g.editing.clone(), frame: g.frame, layer: g.layer, selection: g.selection.clone(), raster_pick: g.raster_pick, bytes: 0 };
+        self.restore(back);
+    }
+
     fn snapshot(&self, label: &str) -> Snapshot {
-        Snapshot { label: label.to_string(), doc: self.doc.clone(), state: self.state, scene: self.scene, editing: self.editing.clone(), frame: self.frame, layer: self.layer, selection: self.selection.clone(), bytes: 0 }
+        Snapshot { label: label.to_string(), doc: self.doc.clone(), state: self.state, scene: self.scene, editing: self.editing.clone(), frame: self.frame, layer: self.layer, selection: self.selection.clone(), raster_pick: self.raster_pick, bytes: 0 }
     }
 
     fn restore(&mut self, s: Snapshot) {
@@ -771,6 +844,12 @@ impl Session {
         self.frame = s.frame;
         self.layer = s.layer;
         self.selection = s.selection;
+        self.raster_pick = s.raster_pick;
+        // A failed command inside a drag keeps the lifted picture. Undo, with no gesture
+        // open, does not: the plate in the snapshot is the picture.
+        if self.gesture.is_none() {
+            self.raster_lift = None;
+        }
         self.dl_cache.replace(None);
     }
 
@@ -794,6 +873,7 @@ impl Session {
         let s = self.history.undo(cur).ok_or_else(|| EngineError::State("nothing to undo".into()))?;
         let label = s.label.clone();
         self.restore(s);
+        self.doc.reissue_plate_stamps();
         self.revision += 1;
         self.fix_selection();
         Ok(json!({ "undone": label }))
@@ -806,6 +886,7 @@ impl Session {
         let s = self.history.redo(cur).ok_or_else(|| EngineError::State("nothing to redo".into()))?;
         let label = s.label.clone();
         self.restore(s);
+        self.doc.reissue_plate_stamps();
         self.revision += 1;
         self.fix_selection();
         Ok(json!({ "redone": label }))
@@ -868,7 +949,7 @@ impl Session {
         // The timeline being edited: a symbol open in place picks in its own layers (ADR 0045).
         let tl = self.timeline();
         let dl = self.display_list();
-        let i = pick_index(&dl, p, slop, |_, it| tl.layer(it.layer).is_some_and(|layer| !layer.locked && !tl.locked_by_folder(layer.id)))?;
+        let i = pick_index(&dl, p, slop, |_, it| it.plate.is_none() && tl.layer(it.layer).is_some_and(|layer| !layer.locked && !tl.locked_by_folder(layer.id)))?;
         dl.items.get(i).map(|it| (it.layer, it.element))
     }
 
@@ -894,7 +975,7 @@ impl Session {
         }
         let tl = self.timeline();
         let dl = anicraft_doc::evaluate_scene_camera(&self.doc, self.scene, self.frame);
-        let i = pick_index(&dl, p, slop, |_, it| tl.layer(it.layer).is_some_and(|layer| !layer.locked && !tl.locked_by_folder(layer.id)))?;
+        let i = pick_index(&dl, p, slop, |_, it| it.plate.is_none() && tl.layer(it.layer).is_some_and(|layer| !layer.locked && !tl.locked_by_folder(layer.id)))?;
         dl.items.get(i).map(|it| (it.layer, it.element))
     }
 
@@ -942,6 +1023,12 @@ impl Session {
             if (l.kind == LayerKind::Armature) != (what == KeyEdit::Pose) {
                 return Err(EngineError::State(if what == KeyEdit::Pose { "that is not an armature layer".into() } else { format!("'{}' is an armature layer: it holds the armature's instances, posed by their bones. Drag a bone (or an instance) to pose it, drag the root instance to move it all, or pick another layer to draw on", l.name) }));
             }
+            if l.kind == LayerKind::Raster && !matches!(what, KeyEdit::Pixels | KeyEdit::Placed) {
+                return Err(EngineError::State(format!("'{}' is a pixel layer. Paint it with the Raster tool, or pick another layer to draw shapes on", l.name)));
+            }
+            if what == KeyEdit::Pixels && l.kind != LayerKind::Raster {
+                return Err(EngineError::State(format!("'{}' is not a pixel layer", l.name)));
+            }
             if tl.locked_by_folder(l.id) {
                 return Err(EngineError::State(format!("layer '{}' is in a locked folder", l.name)));
             }
@@ -981,7 +1068,7 @@ impl Session {
         if sel.is_empty() {
             return Err(EngineError::State("nothing is selected".into()));
         }
-        let kf = self.editable_keyframe()?;
+        let kf = self.editable_keyframe_in(KeyEdit::Placed)?;
         Ok(kf.elements_mut_where(|id| sel.contains(&id)))
     }
 
@@ -1055,6 +1142,11 @@ pub(crate) enum KeyEdit {
     Camera,
     /// A pose, on an armature layer.
     Pose,
+    /// The stage-sized plate on a raster layer (ADR 0112).
+    Pixels,
+    /// An element that already sits on a raster layer: move, duplicate, delete, convert.
+    /// Painting the plate is [`KeyEdit::Pixels`]. Drawing a new shape is still refused.
+    Placed,
 }
 
 /// A colour effect as commands report it (ADR 0056): its style and that style's values, in the

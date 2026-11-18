@@ -28,6 +28,7 @@ pub mod path_table;
 pub mod width;
 pub mod stroke_style;
 pub mod player;
+mod plate;
 pub mod publish;
 pub mod koolgrid;
 pub mod sample;
@@ -37,6 +38,7 @@ pub mod swatch;
 
 pub use filter::{FILTER_PARAMS, Filter, FilterEntry, FilterParam, FilterProp, FilterSide, MAX_FILTER_SLOTS, active as active_filters, any_active as any_active_filter, pairs_up as filters_pair_up, MAX_BLUR, MAX_QUALITY, MAX_RAMP_STOPS, REST_SNAP, default_bevel_ramp, default_glow_ramp, pinned_stop, ramp_at};
 pub use bitmap::{Bitmap, BitmapId, ImageError, MAX_BITMAP_EDGE, Pixels, base64_decode, base64_encode, decode_png, image_to_png};
+pub use plate::{MAX_PLATE_BYTES, PixelImage, PixelRect, PlateDraw, RasterPlate, plate_catch_up, preview_catch_up};
 pub use easing::{CustomEase, EaseDir, EaseFamily, EasePoint, Easing, Handle, MAX_EASE_NAME, MAX_EASE_POINTS, MAX_EASE_SAMPLES, MAX_EASE_Y, MAX_SAVED_EASES, SampledEase, SavedEase, ease_name};
 pub use color_effect::{ADVANCED_ADD, ADVANCED_MUL, ColorEffect, ColorStyle, ColorTransform};
 pub use hints::{HINT_TOLERANCE, HintSide, MAX_SHAPE_HINTS, ShapeHint, hint_index, hint_letter, nearest_outline, placed_on, shapes_centre};
@@ -1137,17 +1139,21 @@ pub struct Keyframe {
     /// On an armature layer: the joint angles this keyframe poses the armature with (ADR 0043).
     #[serde(default, skip_serializing_if = "Pose::is_empty")]
     pub pose: Pose,
+    /// On a raster layer: the stage-sized pixels this keyframe shows (ADR 0112). Empty is
+    /// transparent. Absent until the first stroke. Held for the whole span; not shape-tweened.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub plate: Option<RasterPlate>,
 }
 
 impl PartialEq for Keyframe {
     fn eq(&self, o: &Keyframe) -> bool {
-        self.start == o.start && self.duration == o.duration && self.tween == o.tween && self.motion == o.motion && self.hints == o.hints && self.label == o.label && self.sound == o.sound && self.script == o.script && self.pose == o.pose && arcs_eq(&self.elements, &o.elements)
+        self.start == o.start && self.duration == o.duration && self.tween == o.tween && self.motion == o.motion && self.hints == o.hints && self.label == o.label && self.sound == o.sound && self.script == o.script && self.pose == o.pose && self.plate == o.plate && arcs_eq(&self.elements, &o.elements)
     }
 }
 
 impl Keyframe {
     pub fn new(start: u32, duration: u32) -> Self {
-        Keyframe { start, duration: duration.max(1), elements: Vec::new(), tween: None, motion: None, hints: Vec::new(), label: String::new(), sound: None, script: None, pose: Pose::default() }
+        Keyframe { start, duration: duration.max(1), elements: Vec::new(), tween: None, motion: None, hints: Vec::new(), label: String::new(), sound: None, script: None, pose: Pose::default(), plate: None }
     }
     /// Mutable access to the elements whose ids satisfy `pick`, cloning only those.
     pub fn elements_mut_where(&mut self, mut pick: impl FnMut(ElementId) -> bool) -> Vec<&mut Element> {
@@ -1158,6 +1164,15 @@ impl Keyframe {
     }
     pub fn covers(&self, frame: u32) -> bool {
         frame >= self.start && frame < self.end()
+    }
+
+    /// Whether the timeline should fill this keyframe's dot.
+    ///
+    /// Shapes, the camera, pixels with alpha, a pose, a sound and a script all count.
+    /// A label or a tween by itself does not: those are marks on the span, and the
+    /// circle stays empty.
+    pub fn has_content(&self) -> bool {
+        !self.elements.is_empty() || self.sound.is_some() || self.script.is_some() || !self.pose.is_empty() || self.plate.as_ref().is_some_and(RasterPlate::has_ink)
     }
 }
 
@@ -1179,6 +1194,9 @@ pub enum LayerKind {
     /// An armature (ADR 0043): symbol instances joined by bones ([`Layer::armature`]), posed
     /// on each keyframe ([`Keyframe::pose`]) and tweened between poses.
     Armature,
+    /// Pixels the size of the stage (ADR 0112). The Raster tool paints the plate on the
+    /// keyframe. Vector tools do not draw here. Empty pixels are transparent.
+    Raster,
 }
 
 /// Deepest nesting of folders (and a mask inside them) that is kept.
@@ -1925,6 +1943,21 @@ impl Document {
     }
     /// Every timeline: the scenes', then the library symbols', then the groups' inside them (ADR
     /// 0073), so whatever walks every timeline (Library uses, sounds, paths) sees inside groups.
+    /// New GPU identity for every plate. Undo and redo call this after restoring, so a render
+    /// that still holds the other picture cannot keep its texture.
+    pub fn reissue_plate_stamps(&mut self) {
+        let scenes = self.scenes.len();
+        for i in 0..scenes {
+            reissue_timeline(&mut self.timeline_mut(i), 0);
+        }
+        let symbols = self.library.len();
+        for i in 0..symbols {
+            if let Some(sym) = self.library.get_mut(i) {
+                reissue_timeline(&mut Arc::make_mut(sym).timeline, 0);
+            }
+        }
+    }
+
     pub fn timelines(&self) -> impl Iterator<Item = &Timeline> {
         let top: Vec<&Timeline> = self.scenes.iter().map(|s| &s.timeline).chain(self.library.iter().map(|s| &s.timeline)).collect();
         let mut all = top.clone();
@@ -1987,6 +2020,7 @@ impl Document {
                 sanitize_scripts(l);
                 sanitize_depth(l);
                 sanitize_armature(l);
+                sanitize_plates(l);
                 sanitize_warps(l);
                 scan(l, &mut max_id);
                 sanitize_groups(l, 0, &mut max_id);
@@ -2030,6 +2064,7 @@ impl Document {
                 }
                 sanitize_depth(l);
                 sanitize_armature(l);
+                sanitize_plates(l);
                 sanitize_warps(l);
                 scan(l, &mut max_id);
                 sanitize_groups(l, 0, &mut max_id);
@@ -2049,6 +2084,33 @@ impl Document {
 
 /// The members' timelines of every group on `tl`'s keyframes, and of the groups inside them, in
 /// order, up to [`MAX_GROUP_DEPTH`] deep.
+fn reissue_timeline(tl: &mut Timeline, depth: usize) {
+    if depth >= MAX_GROUP_DEPTH {
+        return;
+    }
+    for layer in &mut tl.layers {
+        let layer = Arc::make_mut(layer);
+        for kf in &mut layer.keyframes {
+            let nested = kf.elements.iter().any(|e| matches!(e.kind, ElementKind::Group { .. }));
+            if kf.plate.is_none() && !nested {
+                continue;
+            }
+            let kf = Arc::make_mut(kf);
+            if let Some(plate) = kf.plate.as_mut() {
+                plate.reissue();
+            }
+            if !nested {
+                continue;
+            }
+            for el in &mut kf.elements {
+                if let ElementKind::Group { members } = &mut Arc::make_mut(el).kind {
+                    reissue_timeline(members, depth + 1);
+                }
+            }
+        }
+    }
+}
+
 fn group_timelines<'a>(tl: &'a Timeline, depth: usize, out: &mut Vec<&'a Timeline>) {
     if depth >= MAX_GROUP_DEPTH {
         return;
@@ -2188,6 +2250,29 @@ fn sanitize_armature(layer: &mut Arc<Layer>) {
     }
 }
 
+/// Drops a plate that is the wrong size, and any plate that is not on a raster layer.
+fn sanitize_plates(layer: &mut Arc<Layer>) {
+    let raster = layer.kind == LayerKind::Raster;
+    let bad = layer.keyframes.iter().any(|k| match &k.plate {
+        Some(_) if !raster => true,
+        Some(p) => !p.is_ok(),
+        None => false,
+    });
+    if !bad {
+        return;
+    }
+    for k in &mut Arc::make_mut(layer).keyframes {
+        let drop = match &k.plate {
+            Some(_) if !raster => true,
+            Some(p) => !p.is_ok(),
+            None => false,
+        };
+        if drop {
+            Arc::make_mut(k).plate = None;
+        }
+    }
+}
+
 /// Repairs a loaded layer's frame scripts and instance event handlers (ADR 0024). Touches (and
 /// so un-shares) only keyframes that need it.
 fn sanitize_scripts(layer: &mut Arc<Layer>) {
@@ -2241,6 +2326,56 @@ mod tests {
         assert_eq!(l.keyframe_index_at(11), Some(2));
         assert_eq!(l.keyframe_index_at(12), None);
         assert_eq!(l.end_frame(), 12);
+    }
+
+    #[test]
+    fn a_blank_frame_stays_empty_until_it_holds_something() {
+        let blank = Keyframe::new(0, 1);
+        assert!(!blank.has_content());
+        let mut labeled = blank.clone();
+        labeled.label = "hold".into();
+        assert!(!labeled.has_content(), "a label is not the drawing");
+
+        let mut drawn = Keyframe::new(0, 1);
+        drawn.elements.push(Arc::new(Element { id: ElementId(1), name: String::new(), transform: anicraft_geom::Affine::IDENTITY, color: ColorEffect::None, kind: ElementKind::Camera }));
+        assert!(drawn.has_content(), "the camera is the camera layer's drawing");
+
+        let mut posed = Keyframe::new(0, 1);
+        posed.pose.set(BoneId(1), 0.5);
+        assert!(posed.has_content(), "an armature pose is the frame's drawing");
+
+        let mut heard = Keyframe::new(0, 1);
+        heard.sound = Some(FrameSound { sound: SoundId(1), sync: SoundSync::Event, repeat: 1, looping: false, effect: SoundEffect::None });
+        assert!(heard.has_content(), "a sound is the frame's drawing");
+
+        let mut scripted = Keyframe::new(0, 1);
+        scripted.script = Some(FrameScript::Actions(vec![Action::Stop { target: crate::actions::Target::this() }]));
+        assert!(scripted.has_content(), "a script is the frame's drawing");
+
+        let mut clear = Keyframe::new(0, 1);
+        clear.plate = RasterPlate::transparent(4, 2);
+        assert!(!clear.has_content(), "a clear plate is an empty frame");
+
+        let mut plate = RasterPlate::transparent(4, 2).expect("plate");
+        assert!(plate.paint_band(1, 2, false, |buf| {
+            buf[3] = 200;
+            true
+        }));
+        assert!(plate.paint_band(0, 1, false, |buf| {
+            buf[0] = 255;
+            true
+        }));
+        assert!(plate.has_ink(), "colour with no alpha on another row does not clear the ink");
+        let mut painted = Keyframe::new(0, 1);
+        painted.plate = Some(plate);
+        assert!(painted.has_content());
+
+        let plate = painted.plate.as_mut().expect("plate");
+        assert!(plate.paint_band(1, 2, false, |buf| {
+            buf[3] = 0;
+            true
+        }));
+        assert!(!painted.has_content(), "clearing the pixels returns the empty circle");
     }
 
     #[test]

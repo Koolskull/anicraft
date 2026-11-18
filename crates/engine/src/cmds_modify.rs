@@ -15,7 +15,7 @@ pub fn specs() -> Vec<CommandSpec> {
         c("edit.copy", "Copy", "Edit", Some("Ctrl+C"), "{} (the selection on every layer, each layer's artwork kept apart)", false, copy),
         c("edit.paste", "Paste in Center", "Edit", Some("Ctrl+V"), "{x?, y?} (centre of the pasted artwork; default: offset 10 px). Artwork copied from one layer lands on the active layer; from several, back on those layers when they are all here, else on the active layer and the ones below it, creating missing ones", true, paste),
         c("edit.paste_in_place", "Paste in Place", "Edit", Some("Ctrl+Shift+V"), "{} (layers as edit.paste)", true, paste_in_place),
-        c("modify.transform", "Transform", "", None, "{a, b, c, d, e, f} affine applied in stage space (free transform), to the selection on every layer", true, |s, p| s.each_layer(true, |s| transform(s, p))),
+        c("modify.transform", "Transform", "", None, "{a, b, c, d, e, f} affine applied in stage space (free transform), to the selection on every layer A raster crop is resampled with it, from the picture at the start of the drag.", true, transform_selection),
         c("modify.rotate_cw", "Rotate 90° CW", "Modify/Transform", Some("Ctrl+Shift+9"), "{}", true, |s, _| about_center(s, Affine::rotate(std::f32::consts::FRAC_PI_2))),
         c("modify.rotate_ccw", "Rotate 90° CCW", "Modify/Transform", Some("Ctrl+Shift+7"), "{}", true, |s, _| about_center(s, Affine::rotate(-std::f32::consts::FRAC_PI_2))),
         c("modify.flip_h", "Flip Horizontal", "Modify/Transform", None, "{}", true, |s, _| about_center(s, Affine::scale(-1.0, 1.0))),
@@ -330,6 +330,30 @@ fn transform(s: &mut Session, p: &Value) -> Result<Value> {
     Ok(json!({"transformed": n}))
 }
 
+/// Elements on every selected layer, and one resample of a raster crop (ADR 0115).
+/// Element-only answers stay what they were. A crop on its own does not walk the layers.
+fn transform_selection(s: &mut Session, p: &Value) -> Result<Value> {
+    let m = Affine { m: [f32_req(p, "a")?, f32_req(p, "b")?, f32_req(p, "c")?, f32_req(p, "d")?, f32_req(p, "e")?, f32_req(p, "f")?] };
+    if !m.is_finite() || m.determinant().abs() < 1e-8 {
+        return Err(EngineError::Param("the transform is degenerate (it would collapse the artwork)".into()));
+    }
+    let pixels = s.raster_pick().is_some();
+    if s.selection.is_empty() {
+        if !pixels {
+            return Err(EngineError::State("nothing is selected".into()));
+        }
+        crate::raster_crop::apply_affine(s, &m)?;
+        return Ok(json!({"transformed": 0, "pixels": true}));
+    }
+    let mut v = s.each_layer(true, |s| transform(s, p))?;
+    if crate::raster_crop::apply_affine(s, &m)?
+        && let Some(obj) = v.as_object_mut()
+    {
+        obj.insert("pixels".into(), json!(true));
+    }
+    Ok(v)
+}
+
 /// `m` applied about the centre of the selection's bounds.
 /// Remove Transform: scale, rotation and skew go back to none; each element keeps its
 /// position (registration point).
@@ -351,7 +375,17 @@ fn about_center(s: &mut Session, m: Affine) -> Result<Value> {
     }
     let c = b.center();
     let full = Affine::translate(c.x, c.y).mul(&m).mul(&Affine::translate(-c.x, -c.y));
-    s.each_layer(true, |s| Ok(json!({"transformed": apply(s, &full)?})))
+    if !full.is_finite() || full.determinant().abs() < 1e-8 {
+        return Err(EngineError::Param("the transform is degenerate (it would collapse the artwork)".into()));
+    }
+    // A crop on its own has no elements for `apply` to walk. The box still turns once.
+    let v = if s.selection.is_empty() {
+        json!({"ok": true})
+    } else {
+        s.each_layer(true, |s| Ok(json!({"transformed": apply(s, &full)?})))?
+    };
+    crate::raster_crop::apply_affine(s, &full)?;
+    Ok(v)
 }
 
 // ----- align ------------------------------------------------------------------------------------

@@ -27,6 +27,7 @@ anicraft-plugins = { path = "crates/plugins" }
 anicraft-audio = { path = "crates/audio" }
 anicraft-gpu = { path = "crates/gpu" }
 anicraft-guide = { path = "crates/guide" }
+anicraft-raster = { path = "crates/raster" }
 craft-anicraft-format = { git = "https://github.com/storytold/craft-libs", rev = "f0f4758c01581d79577b9bf5046c06f4e77b1f18" }
 craft-mime = { version = "0.1.0", git = "https://github.com/storytold/craft-libs", rev = "f0f4758c01581d79577b9bf5046c06f4e77b1f18" }
 craft-html = { version = "0.1.0", git = "https://github.com/storytold/craft-libs", rev = "f0f4758c01581d79577b9bf5046c06f4e77b1f18", default-features = false }
@@ -104,6 +105,7 @@ anicraft-geom.workspace = true
 anicraft-doc.workspace = true
 anicraft-render.workspace = true
 anicraft-engine.workspace = true
+anicraft-raster.workspace = true
 anicraft-gpu = { workspace = true, optional = true }
 egui.workspace = true
 serde.workspace = true

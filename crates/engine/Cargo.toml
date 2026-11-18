@@ -10,6 +10,7 @@ repository.workspace = true
 [dependencies]
 anicraft-geom.workspace = true
 anicraft-doc.workspace = true
+anicraft-raster.workspace = true
 anicraft-render.workspace = true
 anicraft-xfl.workspace = true
 anicraft-svg.workspace = true

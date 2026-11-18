@@ -71,6 +71,7 @@ pub fn tool_id(t: Tool) -> &'static str {
         Tool::Warp => "tool.warp",
         Tool::Hand => "tool.hand",
         Tool::Zoom => "tool.zoom",
+        Tool::Pixel => "tool.pixel",
     }
 }
 

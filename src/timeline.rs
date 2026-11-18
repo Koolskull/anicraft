@@ -596,6 +596,7 @@ pub fn show(app: &mut App, ui: &mut egui::Ui) {
             LayerKind::Guide => (x0 + 7.0, x0 + 20.0, Icon::Guide),
             LayerKind::Camera => (x0 + 7.0, x0 + 20.0, Icon::Camera),
             LayerKind::Armature => (x0 + 7.0, x0 + 20.0, Icon::Bone),
+            LayerKind::Raster => (x0 + 7.0, x0 + 20.0, Icon::Image),
             LayerKind::Normal => (x0 + 7.0, x0 + 20.0, Icon::Layer),
         };
         if is_folder {
@@ -675,6 +676,7 @@ pub fn show(app: &mut App, ui: &mut egui::Ui) {
             LayerKind::Guide => tr!("{name} · guide layer", name = name),
             LayerKind::Camera => tr!("{name} · camera layer", name = name),
             LayerKind::Armature => tr!("{name} · armature layer", name = name),
+            LayerKind::Raster => tr!("{name} · pixel layer", name = name),
             LayerKind::Normal if masked => tr!("{name} · masked layer", name = name),
             LayerKind::Normal => tr!("{name} · layer", name = name),
         };
@@ -885,7 +887,7 @@ pub fn show(app: &mut App, ui: &mut egui::Ui) {
             let next_adjacent = layer.keyframes.get(ki + 1).is_some_and(|n| n.start == k.end());
             let motion = k.motion.as_ref();
             let tweened = k.tween.is_some() && next_adjacent && motion.is_none();
-            let empty = k.elements.is_empty();
+            let empty = !k.has_content();
             let fill = if motion.is_some() {
                 T.tween_motion
             } else if tweened {
@@ -1417,7 +1419,7 @@ pub const MAX_SPAN_NODES: usize = 1_000;
 pub fn span_text(k: &anicraft_engine::doc::Keyframe, next_adjacent: bool) -> String {
     let (a, b) = (k.start + 1, k.end());
     let frames = if k.duration <= 1 { tr!("Frame {a}", a = a) } else { tr!("Frames {a}–{b}", a = a, b = b) };
-    let mut parts: Vec<String> = vec![if k.elements.is_empty() { tr!("blank keyframe").to_string() } else { tr!("keyframe").to_string() }];
+    let mut parts: Vec<String> = vec![if k.has_content() { tr!("keyframe").to_string() } else { tr!("blank keyframe").to_string() }];
     if k.motion.is_some() {
         parts.push(tr!("motion tween").to_string());
     } else if let Some(t) = &k.tween {

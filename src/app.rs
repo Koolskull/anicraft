@@ -37,6 +37,8 @@ pub enum Tool {
     Camera,
     Hand,
     Zoom,
+    /// Pixel paint on an unsaved overlay. The document does not store it.
+    Pixel,
 }
 
 /// Paint Bucket gap size: how wide an opening in an outline still counts as closed. In screen
@@ -71,7 +73,7 @@ impl GapSize {
 }
 
 impl Tool {
-    pub const ALL: [Tool; 24] = [Tool::Select, Tool::Subselect, Tool::Transform, Tool::Warp, Tool::GradientTransform, Tool::Width, Tool::Bone, Tool::Bind, Tool::Pen, Tool::Text, Tool::Pencil, Tool::Brush, Tool::PaintBrush, Tool::Eraser, Tool::Rect, Tool::Oval, Tool::Star, Tool::Line, Tool::PaintBucket, Tool::InkBottle, Tool::Eyedropper, Tool::Camera, Tool::Hand, Tool::Zoom];
+    pub const ALL: [Tool; 25] = [Tool::Select, Tool::Subselect, Tool::Transform, Tool::Warp, Tool::GradientTransform, Tool::Width, Tool::Bone, Tool::Bind, Tool::Pen, Tool::Text, Tool::Pencil, Tool::Brush, Tool::PaintBrush, Tool::Pixel, Tool::Eraser, Tool::Rect, Tool::Oval, Tool::Star, Tool::Line, Tool::PaintBucket, Tool::InkBottle, Tool::Eyedropper, Tool::Camera, Tool::Hand, Tool::Zoom];
 
     pub fn label(self) -> &'static str {
         match self {
@@ -99,6 +101,7 @@ impl Tool {
             Tool::Camera => tr_noop!("Camera"),
             Tool::Hand => tr_noop!("Hand"),
             Tool::Zoom => tr_noop!("Zoom"),
+            Tool::Pixel => tr_noop!("Raster"),
         }
     }
     /// Default shortcut in the command-registry notation; the live key is in `App::keymap`.
@@ -128,6 +131,7 @@ impl Tool {
             Tool::Camera => Some("C"),
             Tool::Hand => Some("H"),
             Tool::Zoom => Some("Z"),
+            Tool::Pixel => Some("D"),
         }
     }
     /// English (a key): translate where it is drawn with `crate::i18n::t`.
@@ -157,6 +161,7 @@ impl Tool {
             Tool::Camera => tr_noop!("Drag on the stage to pan the camera, drag the round handle to turn it, and use the wheel to zoom (each drag is one undo step). Picking the tool adds a camera if the scene has none."),
             Tool::Hand => tr_noop!("Drag to pan the stage. Space works with any tool. Shift+Space and drag turns the canvas about the middle of the view. Ctrl+Space and drag zooms: up in, down out, and the point you pressed stays put. View › Reset Rotation stands the turn back up."),
             Tool::Zoom => tr_noop!("Click to zoom in, Alt-click to zoom out. Ctrl+wheel zooms anywhere. Ctrl+Space and drag zooms: up in, down out."),
+            Tool::Pixel => tr_noop!("Drag to paint pixels on a raster layer the size of the stage. The first stroke adds that layer if you are not already on one. Undo removes the stroke. A light pen uses Thinnest, down to a hairline. The fill colour's alpha, from the colour picker, is the opacity of the whole stroke. Flow is how much one dab lays down: 100% keeps the strongest mark, and lower lets a pencil build up under that alpha. Turn on Pressure › Opacity to let the pen scale that between Minimum and Maximum. The brush list beside the tools sets a raster preset. Turn on Smudge to blend colours already on the layer. Stretch sets how dry that blend is: 0 stays put, and the top is a strong drag that still fades. [ and ] change the size. Shift+Space and drag turns the view. Ctrl+Space and drag zooms."),
         }
     }
 }
@@ -302,6 +307,9 @@ pub enum Drag {
     /// press, so dragging back to that height restores the zoom. `at` is the screen point that
     /// stays over the same stage point.
     ViewZoom { y: f32, zoom: f32, at: egui::Pos2 },
+    /// Pixel tool: the last sample, in the space the pointer samples. Not a document edit.
+    /// `pending` is a pencil press that is waiting for a direction before the first dab.
+    Pixel { x: f32, y: f32, pressure: f32, pending: bool },
 }
 
 /// What a free-transform drag does.
@@ -458,6 +466,8 @@ pub struct App {
     pub brush: crate::brushtool::BrushOptions,
     /// The Paint Brush's options (ADR 0068), its own as in Animate.
     pub paint_brush: crate::brushtool::BrushOptions,
+    /// Pixel tool overlay (not in the document, not undoable). Quit drops it.
+    pub pixel: crate::pixeltool::PixelPaint,
     /// When the last sample came (seconds), for Velocity.
     pub brush_clock: f64,
     /// Window › Brush Library and the brush pickers (ADR 0068).
@@ -755,6 +765,7 @@ impl App {
             pencil_mode: pathtools::PencilMode::default(),
             brush: crate::brushtool::BrushOptions::default(),
             paint_brush: crate::brushtool::BrushOptions::paint_brush(),
+            pixel: crate::pixeltool::PixelPaint::default(),
             brush_clock: 0.0,
             brush_lib: crate::brush_panel::BrushLibraryView::default(),
             filter_naming: Default::default(),
@@ -3428,7 +3439,7 @@ impl App {
         }
         if nudge != egui::Vec2::ZERO && crate::onion::editing(self) {
             crate::onion::nudge(self, anicraft_engine::geom::Vec2::new(nudge.x, nudge.y));
-        } else if nudge != egui::Vec2::ZERO && !self.s.selection.is_empty() {
+        } else if nudge != egui::Vec2::ZERO && (!self.s.selection.is_empty() || self.s.raster_pick().is_some()) {
             // One undo step: the move, and raw shapes merging where they land (ADR 0031).
             let own = !self.s.in_gesture();
             if own {

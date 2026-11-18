@@ -35,6 +35,7 @@ app/                         workspace root; the root package is the desktop app
     actions   L0  Timeline action IR: stop/play/goto, instance targets, button events, frame scripts
     pen-macos L0  macOS pen pressure for the brush (AppKit tablet points, ADR 0096, 0102)
     doc       L1  Document model + timeline evaluation (keyframes, tweens, easing, symbols) + player
+    raster    L1  Pixel dabs on a cropped RGBA cel: hard and antialiased discs, stroke spacing, smudge, clip-to-alpha
     render    L2  CPU oracle rasterizer, paints/gradients, compositor, PNG encode
     engine    L3  Session (document + history + selection + playhead), command registry, file format
     gpu       L3  wgpu stage renderer over the oracle's prepared fills (ADR 0019, 0029, 0032, 0048; shell feature `gpu-stage`, on by default)
@@ -51,6 +52,7 @@ app/                         workspace root; the root package is the desktop app
 | L0 | `anicraft-actions` | serde (knows nothing of documents: targets are name paths) |
 | L0 | `anicraft-pen-macos` | objc2 AppKit on macOS only; only `src/platform.rs` calls it (ADR 0096, 0102) |
 | L1 | `anicraft-doc` | geom, audio, actions |
+| L1 | `anicraft-raster` | std only. Pixel dabs, smudge, and clip-to-alpha on a cropped cel |
 | L2 | `anicraft-render` | geom, doc, rayon, png |
 | L3 | `anicraft-engine` | geom, doc, render, serde_json |
 | L3 | `anicraft-gpu` | geom, doc, render, wgpu (the version egui brings), pollster, bytemuck |

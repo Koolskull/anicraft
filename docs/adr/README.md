@@ -31,3 +31,10 @@ has to renumber because another PR merged first.
 | 0101 | feat/studio-chrome (local) | Blender-style grab, rotate and scale |
 | 0102 | feat/studio-chrome (local) | Pen pressure read in one place |
 | 0103 | feat/studio-chrome (local) | Stroke fill alpha on the colour picker |
+| 0112 | feat/raster-layer | Stage-sized raster layer and blend smudge |
+| 0113 | feat/raster-layer | Hairline raster stroke without copying the plate each move |
+| 0114 | feat/raster-layer | Raster flow: a dab deposits under the fill alpha |
+| 0115 | feat/raster-layer | Raster pixels select as a crop and convert to a symbol |
+| 0116 | feat/raster-layer | Raster spray, paper grain, and a pencil on its side |
+| 0117 | feat/raster-layer | Spray pictures stamped and turned |
+| 0118 | feat/raster-layer | Live raster ink stays smooth under the 2kool grid |

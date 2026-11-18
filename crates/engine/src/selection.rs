@@ -222,6 +222,10 @@ impl Session {
     /// Selects `ids` on the active layer, and nothing else.
     pub fn select_only(&mut self, ids: impl IntoIterator<Item = ElementId>) {
         self.selection = Selection::only(self.layer, ids);
+        // A fresh element selection lets go of a crop. Convert and duplicate call this
+        // after they have already taken the pixels they needed.
+        self.raster_pick = None;
+        self.raster_lift = None;
     }
 
     /// Stage-space bounds of element `id` on `layer` at the playhead.
@@ -242,6 +246,11 @@ impl Session {
             let pad = item.stroke.as_ref().map_or(0.0, anicraft_doc::Stroke::reach);
             r = r.union(&item.path.bounds().inflate(pad).transformed(&item.transform));
         }
+        // The crop is not an element. Free Transform, grab and rotate still box it (ADR 0115).
+        if let Some(pick) = self.raster_pick {
+            let b = pick.rect;
+            r = r.union(&Rect::new(b.x as f32, b.y as f32, b.x as f32 + b.w as f32, b.y as f32 + b.h as f32));
+        }
         r
     }
 
@@ -254,16 +263,17 @@ impl Session {
         if self.timeline().layer(self.layer).is_none() {
             self.layer = self.timeline().layers.first().map_or(LayerId(0), |l| l.id);
         }
-        if self.selection.is_empty() {
-            return;
-        }
-        let mut present: HashMap<LayerId, HashSet<ElementId>> = HashMap::new();
-        for l in self.selection.layers() {
-            if self.selectable(l) {
-                present.insert(l, self.elements_on(l).iter().map(|e| e.id).collect());
+        if !self.selection.is_empty() {
+            let mut present: HashMap<LayerId, HashSet<ElementId>> = HashMap::new();
+            for l in self.selection.layers() {
+                if self.selectable(l) {
+                    present.insert(l, self.elements_on(l).iter().map(|e| e.id).collect());
+                }
             }
+            self.selection.retain(|l, id| present.get(&l).is_some_and(|ids| ids.contains(&id)));
         }
-        self.selection.retain(|l, id| present.get(&l).is_some_and(|ids| ids.contains(&id)));
+        // A crop whose layer, key or ink is gone goes too, even when no element is selected.
+        crate::raster_crop::fix(self);
     }
 
     /// Runs a command's single-layer body once for every layer with selected items, top to

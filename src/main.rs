@@ -66,6 +66,7 @@ mod panels;
 mod motion_path;
 mod onion;
 mod pathtools;
+mod pixeltool;
 mod platform;
 mod plugin_export_ui;
 #[cfg(test)]
@@ -316,6 +317,10 @@ fn main() -> eframe::Result {
     // fails or panics before the window is up falls through to the next; a start that died
     // inside a driver last time tries that way last (#207, `startup`).
     let mut last = startup::begin(platform::log_dir());
+    if let Some(dir) = platform::config_dir() {
+        let n = anicraft_raster::load_pictures(&dir.join("spray"));
+        startup::line(&format!("spray pictures: {n}"));
+    }
     let mut file = file;
     let mut reopened = 0;
     let mut why = String::from("no attempt"); // i18n-exempt: log text
