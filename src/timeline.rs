@@ -10,13 +10,12 @@ use egui::{Align2, Color32, Rect, Sense, Stroke, StrokeKind, WidgetType, pos2, v
 use serde_json::json;
 use std::sync::Arc;
 
-const LAYER_W: f32 = 252.0;
 /// The narrowest the layer column goes, and the least room kept for frames beside it.
-const MIN_LAYER_W: f32 = 150.0;
+const MIN_LAYER_W: f32 = *crate::prefs::LAYER_W_RANGE.start();
 const MIN_FRAMES_W: f32 = 40.0;
-/// Rows are click targets (≥ `theme::TARGET`).
-const ROW_H: f32 = TARGET;
-const RULER_H: f32 = 24.0;
+/// A layer row. Tall enough for a touch-sized toggle (ADR 0121).
+const ROW_H: f32 = 48.0;
+const RULER_H: f32 = 48.0;
 /// Frame cell width at 100 % zoom, and the zoom range (Ctrl+wheel over the frames, or the
 /// slider in the timeline header).
 pub const CELL_DEFAULT: f32 = 12.0;
@@ -36,6 +35,14 @@ fn start_pad(cell_w: f32, extra: f32) -> f32 {
 fn frame_center(cell_left: f32, cell_w: f32) -> f32 {
     (cell_left + cell_w * 0.5).round() + 0.5
 }
+
+/// Where the playhead goes when the ruler is clicked or dragged: the pointed-to frame,
+/// stopped at the last frame that has material (#352), so the playhead never leaves the
+/// edited timeline. Cell clicks, keys and `timeline.goto` keep their own behaviour.
+fn playhead_target(frame: u32, frames: u32) -> u32 {
+    frame.min(frames.saturating_sub(1))
+}
+
 const FOOTER_H: f32 = 38.0;
 /// The bottom bar's frame zoom and Frame View at its right end: the 56 pt slider, its field, the
 /// menu button and spacing.
@@ -105,8 +112,29 @@ fn row_at(h: &[f32], first: usize, dy: f32) -> usize {
     }
     h.len().saturating_sub(1)
 }
-/// Eye / lock / outline toggles: square targets in each layer row.
-const TOGGLE: f32 = 24.0;
+/// Show, lock, outline, onion and mute: a square a finger can hit (ADR 0121).
+const TOGGLE: f32 = 44.0;
+/// Space between those squares, so a tap lands on one of them.
+const TOGGLE_GAP: f32 = 8.0;
+
+/// One toggle, `k` places from the right edge of the layer column. `side` is its box
+/// (the full touch size, or less on a short row).
+fn toggle_rect(right: f32, y: f32, k: f32, side: f32) -> Rect {
+    let x = right - 4.0 - side * 0.5 - k * (side + TOGGLE_GAP);
+    Rect::from_center_size(pos2(x, y), vec2(side, side))
+}
+
+/// The icon inside a toggle, at the Lucide grid's own size once the box is large enough.
+fn toggle_glyph(r: Rect) -> Rect {
+    let s = (r.width().min(r.height()) * 0.55).clamp(16.0, 24.0);
+    Rect::from_center_size(r.center(), vec2(s, s))
+}
+
+/// The outline chip inside its toggle.
+fn toggle_swatch(r: Rect) -> Rect {
+    let s = (r.width().min(r.height()) * 0.42).clamp(10.0, 18.0);
+    Rect::from_center_size(r.center(), vec2(s, s))
+}
 /// Indent per folder or mask level in the layer list.
 const INDENT: f32 = 14.0;
 /// The selected-artwork square after a layer's name (points).
@@ -183,10 +211,101 @@ pub enum TlDrag {
     Span { layer: LayerId, start: u32, end: u32, to: u32 },
 }
 
+/// Where a layer dragged by its name lands (#407), as `layer.move` takes it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LayerDrop {
+    /// Just above this layer, beside it.
+    Before(LayerId),
+    /// Just below this layer and whatever it holds, beside it.
+    After(LayerId),
+    /// First inside this folder.
+    Into(LayerId),
+}
+
+impl LayerDrop {
+    /// The `layer.move` parameters that put `layer` there.
+    pub fn params(self, layer: LayerId) -> serde_json::Value {
+        match self {
+            LayerDrop::Before(t) => json!({"layer": layer.0, "before": t.0}),
+            LayerDrop::After(t) => json!({"layer": layer.0, "after": t.0}),
+            LayerDrop::Into(t) => json!({"layer": layer.0, "into": t.0}),
+        }
+    }
+}
+
+/// A layer row as somewhere to drop a dragged layer.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct DropRow {
+    pub top: f32,
+    pub bottom: f32,
+    pub id: LayerId,
+    pub folder: bool,
+    /// The row under this one, when it shows and is inside this layer (an open folder's first
+    /// layer, a mask's first masked layer).
+    pub first_child: Option<LayerId>,
+    /// The dragged layer itself, or a layer inside it: nowhere to drop.
+    pub dragged: bool,
+}
+
+/// Where a layer dropped at height `y` over `rows` (top down) lands. The upper half of a row
+/// is above it and the lower half below it; a folder's middle half is inside it. Below a row
+/// that shows layers of its own is inside it, above the first of them. `None` over the dragged
+/// layer's own rows, or with no rows at all.
+pub fn layer_drop(rows: &[DropRow], y: f32) -> Option<LayerDrop> {
+    let first = rows.first()?;
+    let row = if y < first.top { first } else { rows.iter().find(|r| y < r.bottom).or(rows.last())? };
+    if row.dragged {
+        return None;
+    }
+    let t = ((y - row.top) / (row.bottom - row.top).max(1.0)).clamp(0.0, 1.0);
+    let below = match row.first_child {
+        Some(_) if row.folder => LayerDrop::Into(row.id),
+        Some(c) => LayerDrop::Before(c),
+        None => LayerDrop::After(row.id),
+    };
+    Some(if row.folder {
+        if t < 0.25 {
+            LayerDrop::Before(row.id)
+        } else if t > 0.75 {
+            below
+        } else {
+            LayerDrop::Into(row.id)
+        }
+    } else if t < 0.5 {
+        LayerDrop::Before(row.id)
+    } else {
+        below
+    })
+}
+
 /// The motion tween span holding `frame` on `layer`, as a frame selection.
 pub(crate) fn whole_motion_span(layer: &Layer, frame: u32) -> Option<FrameSel> {
     let k = layer.keyframe_at(frame).filter(|k| k.motion.is_some())?;
     Some(FrameSel { anchor: (layer.id, k.start), head: (layer.id, k.end() - 1) })
+}
+
+/// The keyframe span that holds a sound at `frame`, as a frame selection. A click on the
+/// waveform picks this whole clip (ADR 0120).
+pub(crate) fn whole_sound_span(layer: &Layer, frame: u32) -> Option<FrameSel> {
+    let k = layer.keyframe_at(frame).filter(|k| k.sound.is_some())?;
+    Some(FrameSel { anchor: (layer.id, k.start), head: (layer.id, k.end() - 1) })
+}
+
+/// When `sel` is exactly one keyframe's whole span and that keyframe has a sound: the layer
+/// and the keyframe's first frame. Delete takes the sound off that clip and leaves the artwork.
+pub(crate) fn sound_clip_selected(sel: FrameSel, layers: &[Arc<Layer>]) -> Option<(LayerId, u32)> {
+    let ids = sel.layers(layers);
+    let [id] = ids.as_slice() else { return None };
+    let layer = layers.iter().find(|l| l.id == *id)?;
+    let (f0, f1) = sel.frames();
+    let k = layer.keyframe_at(f0)?;
+    (k.sound.is_some() && k.start == f0 && k.end().saturating_sub(1) == f1).then_some((layer.id, k.start))
+}
+
+/// `sound_clip_selected` for the timeline's current frame selection.
+pub(crate) fn selected_sound_clip(app: &App) -> Option<(LayerId, u32)> {
+    let sel = app.frame_sel?;
+    sound_clip_selected(sel, &app.s.timeline().layers)
 }
 
 /// Whether Split Motion can cut the motion tween at the playhead (not on its first frame), and
@@ -281,8 +400,13 @@ pub fn paste_params(app: &App) -> Option<serde_json::Value> {
 /// An icon button: a full-size target around a Lucide glyph, named by its tooltip.
 /// `on` is a toggle's state (`None` for a plain button); a toggle that is on is filled.
 pub fn icon_button(ui: &mut egui::Ui, tip: &str, on: Option<bool>, icon: Icon) -> egui::Response {
+    icon_button_wide(ui, tip, on, icon, TARGET + 4.0)
+}
+
+/// [`icon_button`] at another width: narrower at the end of a row of fields in a narrow panel.
+pub fn icon_button_wide(ui: &mut egui::Ui, tip: &str, on: Option<bool>, icon: Icon, width: f32) -> egui::Response {
     let active = on == Some(true);
-    let (rect, resp) = ui.allocate_exact_size(vec2(TARGET + 4.0, TARGET), Sense::click());
+    let (rect, resp) = ui.allocate_exact_size(vec2(width, TARGET), Sense::click());
     // Same language as the tools: a toggle that is on is a lighter gray block, icon white.
     let bg = if active {
         T.active
@@ -394,7 +518,8 @@ pub fn show(app: &mut App, ui: &mut egui::Ui) {
 
     // In a narrow dock (ADR 0087) the layer column gives up width to keep a strip of frames;
     // the layers' toggles stay whole and their names are cut short.
-    let layer_w = LAYER_W.min(body.width() - MIN_FRAMES_W).max(MIN_LAYER_W);
+    // Its width is the user's (the line between the layers and the frames drags, #384).
+    let layer_w = app.tl_layer_w_drag.unwrap_or(app.prefs.timeline_layer_w).min(body.width() - MIN_FRAMES_W).max(MIN_LAYER_W);
     let grid = Rect::from_min_max(pos2(body.left() + layer_w, body.top()), body.right_bottom());
     let frames_total = app.s.frame_count();
     app.tl_cell_w = app.tl_cell_w.clamp(*CELL_RANGE.start(), *CELL_RANGE.end());
@@ -499,6 +624,49 @@ pub fn show(app: &mut App, ui: &mut egui::Ui) {
     painter.rect_filled(ruler, 0.0, T.panel_alt);
     painter.rect_filled(Rect::from_min_max(body.left_top(), pos2(grid.left(), ruler.bottom())), 0.0, T.panel_alt);
     painter.text(pos2(body.left() + 10.0, ruler.center().y), Align2::LEFT_CENTER, tr!("Layers"), font(Type::Heading), color(Type::Heading));
+    // The eye, the padlock and the square above the columns they head show, lock or outline
+    // every layer at once, as in Animate (#422). Each shows its other face once every layer
+    // is that way, and the next click brings them all back.
+    {
+        let (all_hidden, all_locked, all_outline) = {
+            let tl = app.s.timeline();
+            let plain = || tl.layers.iter().filter(|l| l.kind != LayerKind::Camera);
+            let any = plain().next().is_some();
+            (any && plain().all(|l| !l.visible), any && plain().all(|l| l.locked), any && plain().all(|l| l.outline))
+        };
+        let side = TOGGLE.min(RULER_H);
+        let head = |k: f32| toggle_rect(grid.left(), ruler.center().y, k, side);
+        let hover = ui.input(|inp| inp.pointer.hover_pos());
+        for (k, id, salt, name, away) in [
+            (2.0, "layer.toggle_visible", "eye", if all_hidden { tr!("Show all layers") } else { tr!("Hide all layers") }, all_hidden),
+            (1.0, "layer.toggle_lock", "lock", if all_locked { tr!("Unlock all layers") } else { tr!("Lock all layers") }, all_locked),
+            (0.0, "layer.toggle_outline", "outline", if all_outline { tr!("Show all layers as artwork") } else { tr!("Show all layers as outlines") }, all_outline),
+        ] {
+            let r = head(k);
+            if hover.is_some_and(|h| r.contains(h)) {
+                painter.rect_filled(r, T.rc(), T.hover);
+            }
+            let tint = if away { T.text } else { T.text_dim };
+            let glyph = toggle_glyph(r);
+            match salt {
+                "eye" => icons::paint(&painter, glyph, if away { Icon::EyeOff } else { Icon::Eye }, tint),
+                "lock" => icons::paint(&painter, glyph, if away { Icon::Lock } else { Icon::Unlock }, tint),
+                _ => {
+                    let sq = toggle_swatch(r);
+                    if away {
+                        painter.rect_stroke(sq, 0.0, Stroke::new(1.5, tint), StrokeKind::Inside);
+                    } else {
+                        painter.rect_filled(sq, 0.0, tint);
+                    }
+                }
+            }
+            let rr = ui.interact(r, ui.id().with(("all_layers", salt)), Sense::click());
+            a11y::control(ui, &rr, WidgetType::Button, name, None);
+            if rr.on_hover_text(name).clicked() {
+                app.run(id, json!({"all": true}));
+            }
+        }
+    }
     let step = [1u32, 2, 5, 10, 20, 50, 100, 200, 500].into_iter().find(|s| *s as f32 * cell_w >= 28.0).unwrap_or(1000);
     let minor = if cell_w >= 6.0 { 1 } else { step / 5 }.max(1);
     for f in first..first + visible_cols + 1 {
@@ -529,7 +697,7 @@ pub fn show(app: &mut App, ui: &mut egui::Ui) {
         && app.onion_ui.drag.is_none()
         && let Some(p) = ruler_resp.interact_pointer_pos() {
             app.playing = false;
-            app.run("timeline.goto", json!({"frame": frame_at(p.x)}));
+            app.run("timeline.goto", json!({"frame": playhead_target(frame_at(p.x), app.s.frame_count())}));
         }
     // The onion menu on a right-click, as the markers live here (ADR 0047).
     ruler_resp.context_menu(|ui| crate::onion::menu(app, ui));
@@ -604,17 +772,10 @@ pub fn show(app: &mut App, ui: &mut egui::Ui) {
         }
         type_icon(icon_x, icon);
         let icon_rect = Rect::from_center_size(pos2(icon_x, left.center().y), vec2(16.0, tg));
-        let name_at = painter.text(pos2(name_x, left.center().y), Align2::LEFT_CENTER, &layer.name, font(Type::Body), name_color);
-        let has_selection = holding.contains(&layer.id);
-        if has_selection {
-            let sq = Rect::from_center_size(pos2(name_at.right() + 9.0, left.center().y), vec2(SEL_MARK, SEL_MARK));
-            painter.rect_filled(sq, 0.0, to_color32(layer.color));
-            painter.rect_stroke(sq, 0.0, Stroke::new(1.0, T.text), StrokeKind::Outside);
-        }
 
         // Onion / eye / lock / outline toggles, right to left from the outline square: square
         // targets with a hover fill (smaller on short rows).
-        let toggle = |k: f32| Rect::from_center_size(pos2(left.right() - 16.0 - k * (TOGGLE + 2.0), left.center().y), vec2(tg, tg));
+        let toggle = |k: f32| toggle_rect(left.right(), left.center().y, k, tg);
         let (eye, lock, outl) = (toggle(2.0), toggle(1.0), toggle(0.0));
         // The camera has no artwork to outline or onion-skin: its row has the eye (camera on or
         // off) and lock. A folder has no frames to onion-skin.
@@ -625,6 +786,15 @@ pub fn show(app: &mut App, ui: &mut egui::Ui) {
         // With a camera in the scene, layers with artwork can be attached to it (ADR 0082):
         // they then stay put on screen while it moves.
         let attach_t = (tl_now.camera_layer().is_some() && app.s.editing.is_empty() && crate::layer_depth::has_depth(layer.kind)).then(|| toggle(3.0 + f32::from(u8::from(onion_t.is_some())) + f32::from(u8::from(speaker.is_some()))));
+        let leftmost = attach_t.or(speaker).or(onion_t).unwrap_or(eye);
+        let name_rect = Rect::from_min_max(pos2(name_x, left.top()), pos2((leftmost.left() - 6.0).max(name_x + 8.0), left.bottom()));
+        let name_at = painter.with_clip_rect(name_rect).text(pos2(name_x, left.center().y), Align2::LEFT_CENTER, &layer.name, font(Type::Body), name_color);
+        let has_selection = holding.contains(&layer.id);
+        if has_selection {
+            let sq = Rect::from_center_size(pos2((name_at.right() + 9.0).min(name_rect.right() - SEL_MARK), left.center().y), vec2(SEL_MARK, SEL_MARK));
+            painter.rect_filled(sq, 0.0, to_color32(layer.color));
+            painter.rect_stroke(sq, 0.0, Stroke::new(1.0, T.text), StrokeKind::Outside);
+        }
         let hover = ui.input(|inp| inp.pointer.hover_pos());
         for r in [eye, lock, outl].into_iter().take(if is_camera { 2 } else { 3 }).chain(onion_t).chain(speaker).chain(attach_t) {
             if hover.is_some_and(|h| r.contains(h)) {
@@ -633,20 +803,15 @@ pub fn show(app: &mut App, ui: &mut egui::Ui) {
         }
         let c_on = T.text;
         let c_off = T.text_faint;
-        // eye and lock (state shows in the glyph and its brightness)
-        let glyph = |r: Rect| {
-            let s = r.height().min(15.0);
-            Rect::from_center_size(r.center(), vec2(s, s))
-        };
-        icons::paint(&painter, glyph(eye), if layer.visible { Icon::Eye } else { Icon::EyeOff }, if layer.visible { c_on } else { c_off });
-        icons::paint(&painter, glyph(lock), if layer.locked { Icon::Lock } else { Icon::Unlock }, if layer.locked { c_on } else { c_off });
+        icons::paint(&painter, toggle_glyph(eye), if layer.visible { Icon::Eye } else { Icon::EyeOff }, if layer.visible { c_on } else { c_off });
+        icons::paint(&painter, toggle_glyph(lock), if layer.locked { Icon::Lock } else { Icon::Unlock }, if layer.locked { c_on } else { c_off });
         if let Some(sp) = speaker {
-            icons::paint(&painter, glyph(sp), if layer.muted { Icon::SoundOff } else { Icon::Sound }, if layer.muted { T.accent_text } else { c_off });
+            icons::paint(&painter, toggle_glyph(sp), if layer.muted { Icon::SoundOff } else { Icon::Sound }, if layer.muted { T.accent_text } else { c_off });
         }
         // Onion skin for this layer (ADR 0061): bright while onion skin is on and draws it,
         // faint while onion skin is off, struck through when the layer is left out.
         if let Some(ot) = onion_t {
-            let g = glyph(ot);
+            let g = toggle_glyph(ot);
             icons::paint(&painter, g, Icon::Onion, if layer.onion && app.onion.ghosts { c_on } else { c_off });
             if !layer.onion {
                 painter.line_segment([g.left_bottom(), g.right_top()], Stroke::new(1.5, c_off));
@@ -654,10 +819,9 @@ pub fn show(app: &mut App, ui: &mut egui::Ui) {
         }
         // Attached to the camera: the camera glyph, bright when attached.
         if let Some(at) = attach_t {
-            icons::paint(&painter, glyph(at), Icon::Camera, if layer.attached { T.accent_text } else { c_off });
+            icons::paint(&painter, toggle_glyph(at), Icon::Camera, if layer.attached { T.accent_text } else { c_off });
         }
-        // outline swatch
-        let sw = Rect::from_center_size(outl.center(), vec2(10.0, 10.0));
+        let sw = toggle_swatch(outl);
         if is_camera {
             // The swatch shows the frame's colour on the stage.
             painter.rect_filled(sw.shrink(2.0), 0.0, to_color32(layer.color));
@@ -667,7 +831,18 @@ pub fn show(app: &mut App, ui: &mut egui::Ui) {
             painter.rect_filled(sw, 0.0, to_color32(layer.color));
         }
         let name_rect = Rect::from_min_max(left.left_top(), pos2(attach_t.or(speaker).or(onion_t).unwrap_or(eye).left() - 4.0, left.bottom()));
-        let nr = ui.interact(name_rect, ui.id().with(("lname", layer.id.0)), Sense::click());
+        // The name is the row's handle too: drag it to move the layer (#407). The camera stays
+        // on top.
+        let nr = ui.interact(name_rect, ui.id().with(("lname", layer.id.0)), if layer.kind == LayerKind::Camera { Sense::click() } else { Sense::click_and_drag() });
+        if nr.drag_started_by(egui::PointerButton::Primary) && layer.kind != LayerKind::Camera {
+            app.tl_layer_drag = Some(layer.id);
+            if app.s.layer != layer.id {
+                app.run("layer.select", json!({"layer": layer.id.0}));
+            }
+        }
+        if app.tl_layer_drag == Some(layer.id) {
+            painter.rect_filled(left, 0.0, T.accent.gamma_multiply(0.18));
+        }
         // Screen readers hear the row as a selectable item, "Ball · layer", then its toggles.
         let name = &layer.name;
         let row_name = match layer.kind {
@@ -681,6 +856,12 @@ pub fn show(app: &mut App, ui: &mut egui::Ui) {
             LayerKind::Normal => tr!("{name} · layer", name = name),
         };
         let row_name = if has_selection { tr!("{row} · has selected artwork", row = row_name) } else { row_name };
+        // A faded layer says so (ADR 0111): its opacity beside its name, and to screen readers.
+        let faded = ((layer.shown_opacity() * 100.0).round() as u32).min(100);
+        let row_name = if faded < 100 { tr!("{row} · {percent} % opacity", row = row_name, percent = faded) } else { row_name };
+        if faded < 100 && !is_camera {
+            painter.text(pos2(name_rect.right() - 2.0, name_rect.center().y), egui::Align2::RIGHT_CENTER, format!("{faded}%"), crate::theme::font(Type::DataSmall), T.text_faint);
+        }
         a11y::control(ui, &nr, WidgetType::SelectableLabel, &row_name, Some(is_active));
         // Ctrl+F6 lands on the active layer, or on the top row shown when it is scrolled away
         // (rows are drawn top down, so the active row, when drawn, has the last word).
@@ -760,7 +941,7 @@ pub fn show(app: &mut App, ui: &mut egui::Ui) {
             app.run("layer.select", json!({"layer": layer.id.0}));
         }
         if nr.double_clicked() {
-            // On the layer's icon: Layer Properties, as in Animate; on its name: rename.
+            // On the layer's icon: the Layer section of Properties; on its name: rename.
             if nr.interact_pointer_pos().is_some_and(|p| icon_rect.contains(p)) {
                 crate::layer_props::open(app, Some(layer.id));
             } else {
@@ -810,6 +991,15 @@ pub fn show(app: &mut App, ui: &mut egui::Ui) {
             if !is_folder && menus::check_item(ui, tr!("Onion Skin"), layer.onion, true) {
                 app.run("layer.set_onion", json!({"layer": layer.id.0}));
             }
+            // Opacity (ADR 0111, #279): one click for the usual values; any other in Properties.
+            ui.menu_button(tr!("Opacity"), |ui| {
+                let now = (layer.shown_opacity() * 100.0).round() as u32;
+                for o in [100u32, 75, 50, 25, 0] {
+                    if menus::check_item(ui, &format!("{o} %"), now == o, true) {
+                        app.run("layer.set_opacity", json!({"layer": layer.id.0, "opacity": o}));
+                    }
+                }
+            });
             ui.menu_button(tr!("Layer Height"), |ui| {
                 for h in 1..=anicraft_engine::doc::MAX_LAYER_HEIGHT {
                     if menus::check_item(ui, &format!("{} %", u32::from(h) * 100), layer.height() == h, true) {
@@ -902,7 +1092,7 @@ pub fn show(app: &mut App, ui: &mut egui::Ui) {
             // A muted layer's waveform is faint (ADR 0039).
             let wave = if layer.muted { T.text_faint } else if empty && !tweened { T.waveform } else { T.ink };
             if let Some(fs) = &k.sound
-                && !waveform(&cp, &app.s.doc, fs, k, span, x0, cell_w, wave)
+                && !waveform(&cp, &app.s.doc, fs, k, span, WaveAxis::Right { origin: x0, cell: cell_w }, wave)
             {
                 // Still decoding (just opened): draw it when it's ready.
                 ui.ctx().request_repaint_after(std::time::Duration::from_millis(100));
@@ -974,6 +1164,20 @@ pub fn show(app: &mut App, ui: &mut egui::Ui) {
             let g = Rect::from_min_max(pos2(x_of(f0), y + 1.0), pos2(x_of(f1 + 1) - 1.0, y + rh - 1.0)).translate(vec2(by as f32 * cell_w, 0.0));
             cp.rect_stroke(g, SQUARE, Stroke::new(2.0, T.text), StrokeKind::Inside);
         }
+        // The file name on the wave, after the selection tint, so the white stays white.
+        for k in &layer.keyframes {
+            let Some(fs) = &k.sound else { continue };
+            if k.end() < first || k.start > first + visible_cols {
+                continue;
+            }
+            let x0 = x_of(k.start);
+            let x1 = x_of(k.end());
+            let span = Rect::from_min_max(pos2(x0, y + 3.0), pos2(x1 - 1.0, y + rh - 3.0));
+            let left = x0 + (cell_w * 0.5 + 8.0).min((span.width() - 8.0).max(0.0));
+            let area = Rect::from_min_max(pos2(left, span.top()), pos2((span.right() - 4.0).max(left + 1.0), span.bottom()));
+            let Some(snd) = app.s.doc.sound(fs.sound) else { continue };
+            clip_name(&cp.with_clip_rect(span.expand(1.0)), area, &snd.name);
+        }
         // Span length being dragged on this row: the new end line and its length readout.
         if let TlDrag::Span { layer: lid, start, end, to } = app.tl_drag
             && lid == layer.id
@@ -1024,12 +1228,36 @@ pub fn show(app: &mut App, ui: &mut egui::Ui) {
         }
         // The right edge of a span is a handle: drag it to make the span longer or shorter
         // (later frames move with it, as with F5 / Shift+F5).
-        let span_end_at = |px: f32| layer.keyframes.iter().find(|k| k.end() > first && k.start <= first + visible_cols && (x_of(k.end()) - px).abs() <= 4.0).map(|k| (k.start, k.end()));
+        // The handle lies inside the span's last frame, and past the end only where no keyframe
+        // follows: the next keyframe's own cell is for selecting and dragging that keyframe
+        // (#344: a press on the left of a keyframe used to resize the span before it).
+        let span_end_at = |px: f32| {
+            let grip = (cell_w * 0.34).min(4.0);
+            layer.keyframes.iter().enumerate().find(|(n, k)| {
+                let d = px - x_of(k.end());
+                let after = if layer.keyframes.get(n + 1).is_some_and(|next| next.start == k.end()) { 0.0 } else { grip };
+                k.end() > first && k.start <= first + visible_cols && d >= -grip && d < after
+            })
+            .map(|(_, k)| (k.start, k.end()))
+        };
         if cr.hovered() && app.tl_drag == TlDrag::None && cr.hover_pos().and_then(|p| span_end_at(p.x)).is_some() {
             ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeHorizontal);
         }
         if matches!(app.tl_drag, TlDrag::Span { .. }) {
             ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeHorizontal);
+        }
+        // Selected frames that hold keyframes can be dragged away (as in Animate: select, then
+        // drag). The hand says so before the press, and closes while they move (#344).
+        if cr.hovered()
+            && app.tl_drag == TlDrag::None
+            && let Some(p) = cr.hover_pos()
+            && span_end_at(p.x).is_none()
+            && app.frame_sel.is_some_and(|s| s.contains(&layers, i, frame_at(p.x)) && s.has_keys(&layers))
+        {
+            ui.ctx().set_cursor_icon(egui::CursorIcon::Grab);
+        }
+        if matches!(app.tl_drag, TlDrag::Move { .. }) {
+            ui.ctx().set_cursor_icon(if ui.input(|inp| inp.modifiers.alt) { egui::CursorIcon::Copy } else { egui::CursorIcon::Grabbing });
         }
         if cr.drag_started()
             && let Some(p) = ui.input(|inp| inp.pointer.press_origin())
@@ -1065,6 +1293,11 @@ pub fn show(app: &mut App, ui: &mut egui::Ui) {
                 app.frame_sel = Some(FrameSel::cell(layer.id, f));
                 app.tl_drag = TlDrag::Select;
                 select_here(app, f);
+                // A drag that starts on a keyframe nobody selected selects frames, as in
+                // Animate. Someone who meant to move the keyframe reads how (#344).
+                if layer.keyframe_starting_at(f).is_some() {
+                    app.status_ok(tr!("Dragging selects frames. To move a keyframe, click it first, then drag it."));
+                }
             }
         }
         if cr.dragged()
@@ -1162,8 +1395,13 @@ pub fn show(app: &mut App, ui: &mut egui::Ui) {
             let ctrl = ui.input(|inp| inp.modifiers.command);
             match app.frame_sel.as_mut() {
                 Some(sel) if shift => sel.head = (layer.id, f),
-                // A click on a motion tween picks the whole span (Ctrl-click: one frame).
-                _ => app.frame_sel = Some(whole_motion_span(layer, f).filter(|_| !ctrl).unwrap_or(FrameSel::cell(layer.id, f))),
+                // A click on a motion tween picks the whole span. A click on a sound picks the
+                // whole clip the same way (Ctrl-click: one frame). A motion tween wins when
+                // the span has both, and that span already covers the sound.
+                _ => {
+                    let whole = (!ctrl).then(|| whole_motion_span(layer, f).or_else(|| whole_sound_span(layer, f))).flatten();
+                    app.frame_sel = Some(whole.unwrap_or_else(|| FrameSel::cell(layer.id, f)));
+                }
             }
             select_here(app, f);
         }
@@ -1183,6 +1421,113 @@ pub fn show(app: &mut App, ui: &mut egui::Ui) {
         cr.context_menu(|ui| frame_menu(app, ui));
         painter.line_segment([row.left_bottom(), row.right_bottom()], Stroke::new(1.0, T.separator));
     }
+    // A layer dragged by its name (#407): a line shows where it will land, a folder lights up
+    // when it goes inside. Released there it moves in one undo step; Esc, or a release away
+    // from the layers, leaves it where it was.
+    if let Some(dragged) = app.tl_layer_drag {
+        let (pointer, down, cancel) = ui.input(|i| (i.pointer.latest_pos(), i.pointer.primary_down(), i.key_pressed(egui::Key::Escape)));
+        let index_of = |id: LayerId| tl_now.layers.iter().position(|l| l.id == id);
+        let targets: Vec<DropRow> = drop_rows
+            .iter()
+            .enumerate()
+            .filter_map(|(n, (rect, id))| {
+                let i = index_of(*id)?;
+                let next = drop_rows.get(n + 1).map(|(_, c)| *c);
+                Some(DropRow {
+                    top: rect.top(),
+                    bottom: rect.bottom(),
+                    id: *id,
+                    folder: tl_now.layers.get(i).is_some_and(|l| l.kind == LayerKind::Folder),
+                    first_child: next.filter(|c| index_of(*c).is_some_and(|ci| tl_now.is_inside(ci, *id))),
+                    dragged: *id == dragged || tl_now.is_inside(i, dragged),
+                })
+            })
+            .collect();
+        let over = pointer.filter(|p| p.x >= body.left() && p.x < grid.left() && p.y >= ruler.top() && p.y <= body.bottom());
+        let target = over.and_then(|p| layer_drop(&targets, p.y));
+        if cancel || index_of(dragged).is_none() {
+            app.tl_layer_drag = None;
+        } else if !down {
+            app.tl_layer_drag = None;
+            if let Some(t) = target {
+                app.run("layer.move", t.params(dragged));
+            }
+        } else {
+            ui.ctx().set_cursor_icon(if target.is_some() { egui::CursorIcon::Grabbing } else { egui::CursorIcon::NoDrop });
+            let row_of = |id: LayerId| targets.iter().find(|r| r.id == id);
+            let indent = |id: LayerId| body.left() + 8.0 + index_of(id).map_or(0, |i| tl_now.depth(i)) as f32 * INDENT;
+            let line = |x: f32, y: f32| {
+                let y = y.clamp(rows_top + 1.0, rows_bottom - 1.0);
+                painter.circle_filled(pos2(x, y), 3.0, T.accent);
+                painter.line_segment([pos2(x, y), pos2(grid.left(), y)], Stroke::new(2.0, T.accent));
+            };
+            match target {
+                Some(LayerDrop::Before(id)) => {
+                    if let Some(r) = row_of(id) {
+                        line(indent(id), r.top);
+                    }
+                }
+                Some(LayerDrop::After(id)) => {
+                    if let Some(r) = row_of(id) {
+                        line(indent(id), r.bottom);
+                    }
+                }
+                Some(LayerDrop::Into(id)) => {
+                    if let Some(r) = row_of(id) {
+                        painter.rect_stroke(Rect::from_min_max(pos2(body.left(), r.top), pos2(grid.left(), r.bottom)), 0.0, Stroke::new(2.0, T.accent), StrokeKind::Inside);
+                    }
+                }
+                None => {}
+            }
+            // Near the top or bottom edge the list scrolls, so any row can be reached.
+            if let Some(p) = over {
+                let edge = base_h * 0.5;
+                if p.y < rows_top + edge {
+                    app.tl_vscroll = (app.tl_vscroll - 0.15).max(0.0);
+                } else if p.y > rows_bottom - edge {
+                    app.tl_vscroll += 0.15;
+                }
+            }
+            ui.ctx().request_repaint();
+        }
+    }
+
+    // The line between the layers and the frames drags (#384): narrower gives the frames more
+    // room, as in Animate; a double-click puts it back. Kept in the preferences.
+    {
+        let split = Rect::from_min_max(pos2(grid.left() - 2.0, body.top()), pos2(grid.left() + 3.0, rows_bottom));
+        let sid = ui.id().with("layer_column_split");
+        let sr = ui.interact(split, sid, Sense::click_and_drag());
+        ui.ctx().accesskit_node_builder(sid, |node| {
+            node.set_role(egui::accesskit::Role::Splitter);
+            node.set_label(tr!("Resize the layer names and the frames"));
+        });
+        if (sr.hovered() || sr.dragged()) && app.tl_layer_drag.is_none() {
+            ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeHorizontal);
+            painter.rect_filled(Rect::from_center_size(pos2(grid.left(), split.center().y), vec2(2.0, split.height())), 0.0, T.accent);
+        }
+        let range = crate::prefs::LAYER_W_RANGE;
+        if sr.dragged()
+            && let Some(p) = sr.interact_pointer_pos()
+        {
+            app.tl_layer_w_drag = Some((p.x - body.left()).clamp(*range.start(), *range.end()));
+        }
+        let set = if sr.double_clicked() {
+            app.tl_layer_w_drag = None;
+            Some(crate::prefs::LAYER_W_DEFAULT)
+        } else if sr.drag_stopped() {
+            app.tl_layer_w_drag.take()
+        } else {
+            None
+        };
+        if let Some(w) = set.filter(|w| (*w - app.prefs.timeline_layer_w).abs() > 0.01) {
+            let mut p = app.prefs.clone();
+            p.timeline_layer_w = w;
+            let ctx = ui.ctx().clone();
+            app.set_prefs(&ctx, p);
+        }
+    }
+
     // Layout lines: layer list | frame grid, and the header above.
     painter.line_segment([pos2(grid.left(), body.top()), pos2(grid.left(), body.bottom())], Stroke::new(1.0, T.border));
     painter.line_segment([body.left_top(), body.right_top()], Stroke::new(1.0, T.border));
@@ -1346,7 +1691,7 @@ fn color_menu(app: &mut App, ui: &mut egui::Ui, layer: LayerId, color: anicraft_
             let typed = if hex.starts_with('#') { hex.trim().to_string() } else { format!("#{}", hex.trim()) };
             app.run("layer.set_color", json!({"layer": layer.0, "color": typed}));
         }
-        if ui.button(tr!("More…")).on_hover_text(tr!("Pick any colour in Layer Properties")).clicked() {
+        if ui.button(tr!("More…")).on_hover_text(tr!("Pick any colour in the Properties panel")).clicked() {
             crate::layer_props::open(app, Some(layer));
             ui.close();
         }
@@ -1499,41 +1844,74 @@ fn frame_nodes(app: &mut App, ui: &mut egui::Ui, grid: &egui::Response, layer: &
 }
 
 
-/// Engine param for an easing preset.
+/// Which way time runs for a waveform. The filmstrip runs it to the right. The X-sheet runs
+/// it down the page. Both read the same samples.
+pub(crate) enum WaveAxis {
+    /// `origin` is the keyframe's left edge. `cell` is the width of one frame.
+    Right { origin: f32, cell: f32 },
+    /// `origin` is the keyframe's top edge. `cell` is the height of one frame.
+    Down { origin: f32, cell: f32 },
+}
+
+/// The file name on a waveform. White, with a 1 px black edge, so it reads on the wave (ADR 0122).
+pub(crate) fn clip_name(p: &egui::Painter, area: Rect, name: &str) {
+    if name.is_empty() || area.width() < 8.0 || area.height() < 8.0 {
+        return;
+    }
+    let mut job = egui::text::LayoutJob::simple_singleline(name.to_string(), font(Type::Caption), Color32::PLACEHOLDER);
+    job.wrap = egui::text::TextWrapping { max_width: area.width(), max_rows: 1, break_anywhere: true, overflow_character: Some('…') };
+    let galley = p.layout_job(job);
+    let pos = pos2(area.left(), area.center().y - galley.size().y * 0.5);
+    for dy in -1..=1 {
+        for dx in -1..=1 {
+            if dx == 0 && dy == 0 {
+                continue;
+            }
+            p.galley_with_override_text_color(pos + vec2(dx as f32, dy as f32), galley.clone(), Color32::BLACK);
+        }
+    }
+    p.galley_with_override_text_color(pos, galley, Color32::WHITE);
+}
+
 /// A keyframe's sound over its span: the waveform from the keyframe on, repeated as the sound
 /// repeats, as far as the span reaches (all a stream sound plays; an event sound plays on past
-/// it), shaped by its effect's envelope (the louder channel's level). One line per point
-/// column, from the lowest to the highest sample under it. `false` while the sound is still
-/// being decoded.
+/// it), shaped by its effect's envelope (the louder channel's level). One line per point along
+/// the span, from the lowest to the highest sample under it. A short column is those samples;
+/// a long one is the block peaks. `false` while the sound is still being decoded.
 #[allow(clippy::too_many_arguments)]
-fn waveform(p: &egui::Painter, doc: &anicraft_engine::doc::Document, fs: &anicraft_engine::doc::FrameSound, k: &anicraft_engine::doc::Keyframe, span: Rect, x0: f32, cell_w: f32, color: Color32) -> bool {
+pub(crate) fn waveform(p: &egui::Painter, doc: &anicraft_engine::doc::Document, fs: &anicraft_engine::doc::FrameSound, k: &anicraft_engine::doc::Keyframe, span: Rect, axis: WaveAxis, color: Color32) -> bool {
     let Some(snd) = doc.sound(fs.sound) else { return true };
     let Some(dec) = snd.decoded_if_ready() else { return false };
     let len = dec.peaks.frames() as u64;
-    if len == 0 || cell_w <= 0.0 {
+    let (origin, cell, down) = match axis {
+        WaveAxis::Right { origin, cell } => (origin, cell, false),
+        WaveAxis::Down { origin, cell } => (origin, cell, true),
+    };
+    if len == 0 || cell <= 0.0 {
         return true;
     }
     let env = (!fs.effect.is_none()).then(|| fs.effect.points(fs.heard_seconds(snd, k.duration, doc.frame_count().saturating_sub(k.start), doc.stage.fps)));
     let rate = f64::from(dec.pcm.rate.max(1));
     let total = if fs.looping { u64::MAX } else { len.saturating_mul(u64::from(fs.repeat.max(1))) };
-    let per_point = f64::from(dec.pcm.rate) / f64::from(doc.stage.fps.max(1.0)) / f64::from(cell_w);
-    let clip = p.clip_rect().intersect(span.shrink2(vec2(0.0, 1.0)));
-    let (cy, h) = (clip.center().y, clip.height() * 0.5);
+    let per_point = f64::from(dec.pcm.rate) / f64::from(doc.stage.fps.max(1.0)) / f64::from(cell);
+    // Amplitude fills the span. Time walks only the part on screen.
+    let (cross, half) = if down { (span.center().x, span.width() * 0.5) } else { (span.center().y, span.height() * 0.5) };
+    let clip = p.clip_rect().intersect(span);
     let stroke = Stroke::new(1.0, color);
-    let mut x = clip.left().floor().max(span.left());
-    while x < clip.right() {
-        let a = (f64::from(x - x0) * per_point).max(0.0) as u64;
-        let b = (f64::from(x + 1.0 - x0) * per_point).max(0.0) as u64 + 1;
+    let (mut t, end) = if down { (clip.top().floor().max(span.top()), clip.bottom()) } else { (clip.left().floor().max(span.left()), clip.right()) };
+    while t < end {
+        let a = (f64::from(t - origin) * per_point).max(0.0) as u64;
+        let b = (f64::from(t + 1.0 - origin) * per_point).max(0.0) as u64 + 1;
         if a >= total {
             break;
         }
         let b = b.min(total);
-        // The source frames under this column, within one play of the sound.
+        // The source frames under this point, within one play of the sound.
         let (s, n) = ((a % len) as usize, (b - a).min(len) as usize);
         let range = if s + n <= len as usize {
-            dec.peaks.range(s, s + n)
+            dec.peaks.extent(&dec.pcm, s, s + n)
         } else {
-            let (p1, p2) = (dec.peaks.range(s, len as usize), dec.peaks.range(0, s + n - len as usize));
+            let (p1, p2) = (dec.peaks.extent(&dec.pcm, s, len as usize), dec.peaks.extent(&dec.pcm, 0, s + n - len as usize));
             match (p1, p2) {
                 (Some((l1, h1)), Some((l2, h2))) => Some((l1.min(l2), h1.max(h2))),
                 (one, other) => one.or(other),
@@ -1544,10 +1922,17 @@ fn waveform(p: &egui::Painter, doc: &anicraft_engine::doc::Document, fs: &anicra
                 let (l, r) = crate::envelope::level_at(pts, a as f64 / rate);
                 l.max(r)
             });
-            let (top, bottom) = (cy - (hi * g).clamp(-1.0, 1.0) * h, cy - (lo * g).clamp(-1.0, 1.0) * h);
-            p.line_segment([pos2(x + 0.5, top.min(cy - 0.5)), pos2(x + 0.5, bottom.max(cy + 0.5))], stroke);
+            let (lo, hi) = ((lo * g).clamp(-1.0, 1.0), (hi * g).clamp(-1.0, 1.0));
+            if down {
+                // Positive samples go to the right, the way they go up on the filmstrip.
+                let (left, right) = (cross + lo * half, cross + hi * half);
+                p.line_segment([pos2(left.min(cross - 0.5), t + 0.5), pos2(right.max(cross + 0.5), t + 0.5)], stroke);
+            } else {
+                let (top, bottom) = (cross - hi * half, cross - lo * half);
+                p.line_segment([pos2(t + 0.5, top.min(cross - 0.5)), pos2(t + 0.5, bottom.max(cross + 0.5))], stroke);
+            }
         }
-        x += 1.0;
+        t += 1.0;
     }
     true
 }
@@ -1566,6 +1951,12 @@ pub(crate) fn frame_menu(app: &mut App, ui: &mut egui::Ui) {
     ui.set_min_width(220.0);
     for id in ["timeline.insert_frame", "timeline.remove_frame", "timeline.insert_keyframe", "timeline.insert_blank_keyframe", "timeline.clear_keyframe"] {
         menus::cmd_item(app, ui, id);
+    }
+    // The cell under the pointer is already the playhead. Remove Sound takes the clip off
+    // that keyframe and leaves the drawing (ADR 0120).
+    if app.s.active_layer().is_some_and(|l| l.keyframe_at(app.s.frame).is_some_and(|k| k.sound.is_some())) && ui.button(tr!("Remove Sound")).clicked() {
+        app.request("sound.remove", json!({"layer": app.s.layer.0, "frame": app.s.frame}));
+        ui.close();
     }
     ui.separator();
     for id in ["timeline.cut_frames", "timeline.copy_frames", "timeline.paste_frames"] {
@@ -1758,6 +2149,12 @@ mod tests {
         assert_eq!(max_first_row(&[], 50.0), 0);
         // Short rows, and a 200 % short row is two of them.
         assert!(base_row_h(true) < base_row_h(false));
+        assert!(TOGGLE >= 44.0, "show, lock, outline and onion are a touch target");
+        assert!(ROW_H >= TOGGLE + 2.0 && RULER_H >= TOGGLE);
+        // Four squares and the gap between them fit in the narrowest layer column.
+        let cluster = 4.0 + 4.0 * (TOGGLE + TOGGLE_GAP);
+        assert!(*crate::prefs::LAYER_W_RANGE.start() + 0.5 >= cluster);
+        assert!(crate::prefs::LAYER_W_DEFAULT >= cluster + 96.0, "a short name fits beside the toggles");
         // The frame widths run Tiny to Large inside the zoom range, Normal at 100 %.
         assert!(FRAME_WIDTHS.windows(2).all(|w| w[0].1 < w[1].1));
         assert!(FRAME_WIDTHS.iter().all(|(_, w)| CELL_RANGE.contains(w)));
@@ -1783,6 +2180,50 @@ mod tests {
         assert!(spill <= 0.5, "the timeline header overflows by {spill:.0} pt at 1600 × 940");
         // The measure is real: at the smallest window the header scrolls sideways instead.
         assert!(header_spill(960.0) > 0.5);
+    }
+
+    #[test]
+    fn the_file_name_sits_on_the_wave_in_white_with_a_black_edge() {
+        let ctx = egui::Context::default();
+        let mut app = App::with_context(&ctx, anicraft_engine::Session::default(), Some(std::path::PathBuf::from("unused.png")));
+        let layer = app.s.layer;
+        app.run("timeline.insert_frame", json!({"layer": layer.0, "frame": 0, "count": 11}));
+        let dir = std::env::temp_dir().join(format!("anicraft-wname-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let wav = dir.join("beep.wav");
+        // A spike, then silence, then another spike: a block summary would smear the first one.
+        let mut samples = vec![0.0f32; 4000];
+        samples[8] = 0.9;
+        samples[2000] = -0.7;
+        let bytes = anicraft_engine::doc::audio::wav::encode(8000, 1, &samples, anicraft_engine::doc::audio::wav::Bits::Int16);
+        assert!(std::fs::write(&wav, bytes).is_ok(), "the test tone can be written");
+        let dropped = app.run("file.drop", json!({"path": wav.display().to_string(), "to": "timeline", "layer": layer.0, "frame": 0}));
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(dropped.is_some(), "the sound lands on the keyframe");
+        let input = egui::RawInput { screen_rect: Some(Rect::from_min_size(egui::Pos2::ZERO, vec2(1600.0, 940.0))), ..Default::default() };
+        let mut shapes = Vec::new();
+        for _ in 0..4 {
+            let mut out = ctx.run_ui(input.clone(), |ui| app.frame(ui));
+            out.textures_delta.clear();
+            shapes = out.shapes;
+        }
+        let marks: Vec<_> = shapes
+            .iter()
+            .filter_map(|cs| {
+                let egui::epaint::Shape::Text(t) = &cs.shape else { return None };
+                t.galley.job.text.contains("beep.wav").then_some((t.pos, t.override_text_color))
+            })
+            .collect();
+        let white: Vec<_> = marks.iter().filter(|(_, c)| *c == Some(Color32::WHITE)).map(|(p, _)| *p).collect();
+        let black: Vec<_> = marks.iter().filter(|(_, c)| *c == Some(Color32::BLACK)).map(|(p, _)| *p).collect();
+        assert!(!white.is_empty(), "the file name is white");
+        assert!(
+            white.iter().any(|w| black.iter().any(|b| {
+                let (dx, dy) = ((b.x - w.x).abs(), (b.y - w.y).abs());
+                ((dx - 1.0).abs() < 0.05 && dy < 0.05) || ((dy - 1.0).abs() < 0.05 && dx < 0.05)
+            })),
+            "a 1 px black edge sits on the file name"
+        );
     }
 
     #[test]
@@ -1878,5 +2319,182 @@ mod tests {
         assert!(FrameSel::cell(LayerId(1), 0).has_keys(&ls));
         // A deleted layer invalidates the selection.
         assert!(FrameSel { anchor: (LayerId(9), 0), head: (LayerId(1), 0) }.layers(&ls).is_empty());
+    }
+
+    use egui::{Event, Modifiers, PointerButton, Pos2};
+
+    /// One frame of the whole app with these events; the cursor it asked for.
+    fn frame(ctx: &egui::Context, app: &mut App, events: Vec<Event>, modifiers: Modifiers) -> egui::CursorIcon {
+        let mut all = vec![Event::ModifiersChanged(modifiers)];
+        all.extend(events);
+        let input = egui::RawInput { screen_rect: Some(Rect::from_min_size(Pos2::ZERO, vec2(1600.0, 940.0))), events: all, ..Default::default() };
+        let mut out = ctx.run_ui(input, |ui| app.frame(ui));
+        out.textures_delta.clear();
+        out.platform_output.cursor_icon
+    }
+    fn settle(ctx: &egui::Context, app: &mut App) {
+        for _ in 0..3 {
+            frame(ctx, app, Vec::new(), Modifiers::NONE);
+        }
+    }
+    fn button(pos: Pos2, pressed: bool, modifiers: Modifiers) -> Event {
+        Event::PointerButton { pos, button: PointerButton::Primary, pressed, modifiers }
+    }
+    fn drag(ctx: &egui::Context, app: &mut App, from: Pos2, to: Pos2, modifiers: Modifiers) {
+        frame(ctx, app, vec![Event::PointerMoved(from)], modifiers);
+        frame(ctx, app, vec![button(from, true, modifiers)], modifiers);
+        for i in 1..=10 {
+            frame(ctx, app, vec![Event::PointerMoved(from + (to - from) * (i as f32 / 10.0))], modifiers);
+        }
+        frame(ctx, app, vec![button(to, false, modifiers)], modifiers);
+        settle(ctx, app);
+    }
+    fn click(ctx: &egui::Context, app: &mut App, at: Pos2, modifiers: Modifiers) {
+        frame(ctx, app, vec![Event::PointerMoved(at)], modifiers);
+        frame(ctx, app, vec![button(at, true, modifiers)], modifiers);
+        frame(ctx, app, vec![button(at, false, modifiers)], modifiers);
+        settle(ctx, app);
+    }
+
+    /// #344: a keyframe moves the way it does in Animate: click it, then drag it. The hand
+    /// cursor over selected keyframes says it can be dragged; a drag that starts on a keyframe
+    /// nobody selected still selects a range of frames, and says how to move one.
+    #[test]
+    fn a_selected_keyframe_shows_the_hand_and_drags_away() {
+        let ctx = egui::Context::default();
+        let mut app = App::with_context(&ctx, anicraft_engine::Session::default(), Some(std::path::PathBuf::from("unused.png")));
+        app.show_panel(crate::dock::Panel::Timeline);
+        let layer = app.s.layer;
+        app.run("timeline.insert_frame", json!({"layer": layer.0, "frame": 0, "count": 11}));
+        app.run("timeline.insert_keyframe", json!({"layer": layer.0, "frame": 3}));
+        app.s.set_frame(0);
+        settle(&ctx, &mut app);
+        let Some((cells, x0, cell_w, scroll)) = ctx.data(|d| d.get_temp::<(egui::Rect, f32, f32, f32)>(egui::Id::new("tl_geometry"))) else { panic!("the timeline drew") };
+        let at = |f: u32| pos2(x0 + (f as f32 - scroll) * cell_w + cell_w * 0.5, cells.center().y);
+        let starts = |app: &App| app.s.active_layer().map(|l| l.keyframes.iter().map(|k| k.start).collect::<Vec<_>>()).unwrap_or_default();
+        assert_eq!(starts(&app), vec![0, 3]);
+
+        // Nothing selected: a press and drag on the keyframe selects frames 3..=6, moves nothing.
+        assert_ne!(frame(&ctx, &mut app, vec![Event::PointerMoved(at(3))], Modifiers::NONE), egui::CursorIcon::Grab);
+        drag(&ctx, &mut app, at(3), at(6), Modifiers::NONE);
+        assert_eq!(starts(&app), vec![0, 3], "a first drag selects, as in Animate");
+        assert_eq!(app.frame_sel.map(|s| s.frames()), Some((3, 6)));
+        assert!(app.status.as_ref().is_some_and(|s| !s.error && s.text.contains("click it first")), "the hint: {:?}", app.status.as_ref().map(|s| &s.text));
+
+        // Click the keyframe: it is selected, and the hand shows over it (not over other frames).
+        click(&ctx, &mut app, at(3), Modifiers::NONE);
+        assert_eq!(app.frame_sel.map(|s| s.frames()), Some((3, 3)));
+        assert_eq!(frame(&ctx, &mut app, vec![Event::PointerMoved(at(3))], Modifiers::NONE), egui::CursorIcon::Grab);
+        assert_ne!(frame(&ctx, &mut app, vec![Event::PointerMoved(at(5))], Modifiers::NONE), egui::CursorIcon::Grab);
+
+        // Drag it: the keyframe moves to frame 7 and stays selected, in one undo step.
+        frame(&ctx, &mut app, vec![Event::PointerMoved(at(3))], Modifiers::NONE);
+        frame(&ctx, &mut app, vec![button(at(3), true, Modifiers::NONE)], Modifiers::NONE);
+        frame(&ctx, &mut app, vec![Event::PointerMoved(at(5))], Modifiers::NONE);
+        assert_eq!(frame(&ctx, &mut app, vec![Event::PointerMoved(at(7))], Modifiers::NONE), egui::CursorIcon::Grabbing);
+        frame(&ctx, &mut app, vec![button(at(7), false, Modifiers::NONE)], Modifiers::NONE);
+        settle(&ctx, &mut app);
+        assert_eq!(starts(&app), vec![0, 7]);
+        assert_eq!(app.frame_sel.map(|s| s.frames()), Some((7, 7)));
+        app.run("edit.undo", json!({}));
+        assert_eq!(starts(&app), vec![0, 3]);
+    }
+
+    #[test]
+    fn a_whole_sound_span_is_the_clip_and_a_part_of_it_is_not() {
+        let mut layer = Layer::new(LayerId(1), "L1");
+        let mut k = anicraft_engine::doc::Keyframe::new(0, 12);
+        k.sound = Some(anicraft_engine::doc::FrameSound::new(anicraft_engine::doc::SoundId(1)));
+        layer.keyframes = vec![Arc::new(k)];
+        let held = vec![Arc::new(layer)];
+        let whole = whole_sound_span(&held[0], 7);
+        assert_eq!(whole.map(|s| s.frames()), Some((0, 11)));
+        let Some(whole) = whole else { return };
+        assert_eq!(sound_clip_selected(whole, &held), Some((LayerId(1), 0)));
+        assert!(sound_clip_selected(FrameSel::cell(LayerId(1), 7), &held).is_none(), "one cell of a longer clip is not the whole clip");
+        assert!(sound_clip_selected(FrameSel { anchor: (LayerId(1), 0), head: (LayerId(1), 4) }, &held).is_none());
+        let quiet = layers(1);
+        assert!(whole_sound_span(&quiet[0], 0).is_none());
+    }
+
+    /// Click the waveform, and Delete takes that sound off. The drawing stays. A partial
+    /// selection, and a Ctrl-click of one cell, do not.
+    #[test]
+    fn clicking_a_sound_selects_the_clip_and_delete_takes_it_off() {
+        let ctx = egui::Context::default();
+        let mut app = App::with_context(&ctx, anicraft_engine::Session::default(), Some(std::path::PathBuf::from("unused.png")));
+        app.show_panel(crate::dock::Panel::Timeline);
+        let layer = app.s.layer;
+        app.run("draw.rect", json!({"x": 0, "y": 0, "w": 10, "h": 10}));
+        app.run("timeline.insert_frame", json!({"layer": layer.0, "frame": 0, "count": 11}));
+        let dir = std::env::temp_dir().join(format!("anicraft-tlclick-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let wav = dir.join("beep.wav");
+        let bytes = anicraft_engine::doc::audio::wav::encode(8000, 1, &[0.25; 4000], anicraft_engine::doc::audio::wav::Bits::Int16);
+        assert!(std::fs::write(&wav, bytes).is_ok(), "the test tone can be written");
+        let dropped = app.run("file.drop", json!({"path": wav.display().to_string(), "to": "timeline", "layer": layer.0, "frame": 0}));
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(dropped.is_some(), "the sound lands on the keyframe");
+        let clip = |app: &App| app.s.timeline().layer(layer).and_then(|l| l.keyframes.first()).map(|k| (k.sound.is_some(), k.elements.len(), k.end().saturating_sub(1)));
+        let Some((sounding, drawn, last)) = clip(&app) else {
+            panic!("the keyframe is there");
+        };
+        assert!(sounding && drawn > 0 && last == 11, "a twelve-frame clip, with the drawing: {sounding} {drawn} {last}");
+        app.s.set_frame(0);
+        settle(&ctx, &mut app);
+        let Some((cells, x0, cell_w, scroll)) = ctx.data(|d| d.get_temp::<(egui::Rect, f32, f32, f32)>(egui::Id::new("tl_geometry"))) else {
+            panic!("the timeline drew");
+        };
+        let at = |f: u32| pos2(x0 + (f as f32 - scroll) * cell_w + cell_w * 0.5, cells.center().y);
+        click(&ctx, &mut app, at(6), Modifiers::NONE);
+        assert!(app.timeline_focus);
+        assert_eq!(app.frame_sel.map(|s| s.frames()), Some((0, 11)), "a click on the waveform selects the whole clip");
+        let steps = app.s.history_len();
+        app.invoke("edit.delete");
+        assert_eq!(app.s.history_len(), steps + 1, "one undo step");
+        assert_eq!(clip(&app), Some((false, drawn, 11)), "the sound is gone and the drawing stays");
+        assert!(app.status.as_ref().is_some_and(|s| !s.error && s.text.contains("Removed the sound")));
+        app.run("edit.undo", json!({}));
+        assert_eq!(clip(&app).map(|c| c.0), Some(true));
+        // A few frames of the clip: Delete does not take the sound.
+        app.run("edit.deselect", json!({}));
+        app.timeline_focus = true;
+        app.frame_sel = Some(FrameSel { anchor: (layer, 2), head: (layer, 4) });
+        app.invoke("edit.delete");
+        assert_eq!(clip(&app), Some((true, drawn, 11)));
+        // Ctrl-click (Command on macOS) stays one cell.
+        click(&ctx, &mut app, at(6), Modifiers { command: true, ..Modifiers::NONE });
+        assert_eq!(app.frame_sel.map(|s| s.frames()), Some((6, 6)));
+        app.invoke("edit.delete");
+        assert_eq!(clip(&app).map(|c| c.0), Some(true), "one cell is not the whole clip");
+    }
+
+    #[test]
+    fn the_ruler_playhead_stops_at_the_last_frame_with_material() {
+        assert_eq!(playhead_target(26, 8), 7);
+        assert_eq!(playhead_target(3, 8), 3);
+        assert_eq!(playhead_target(0, 0), 0);
+        let ctx = egui::Context::default();
+        let mut app = App::with_context(&ctx, anicraft_engine::Session::default(), Some(std::path::PathBuf::from("unused.png")));
+        app.show_panel(crate::dock::Panel::Timeline);
+        let layer = app.s.layer;
+        app.run("timeline.insert_frame", json!({"layer": layer.0, "frame": 0, "count": 7}));
+        app.s.set_frame(0);
+        settle(&ctx, &mut app);
+        assert_eq!(app.s.frame_count(), 8);
+        // Where the active row's frames are drawn, as the timeline drew them.
+        let row = ctx.data(|d| d.get_temp::<(egui::Rect, f32, f32, f32)>(egui::Id::new("tl_geometry")));
+        let Some((cells, x0, cell_w, scroll)) = row else { panic!("the timeline drew") };
+        // The ruler sits directly above the cells; the frame's column is its centre.
+        let y = cells.top() - RULER_H / 2.0;
+        let x = |f: u32| x0 + (f as f32 - scroll) * cell_w + cell_w * 0.5;
+        // Dragging past the material stops at the last frame that has it (#352).
+        drag(&ctx, &mut app, pos2(x(2), y), pos2(x(26), y), Modifiers::NONE);
+        assert_eq!(app.s.frame, 7);
+        // A click past the end clamps too, while a drag inside still moves freely.
+        drag(&ctx, &mut app, pos2(x(7), y), pos2(x(3), y), Modifiers::NONE);
+        assert_eq!(app.s.frame, 3);
+        click(&ctx, &mut app, pos2(x(12), y), Modifiers::NONE);
+        assert_eq!(app.s.frame, 7);
     }
 }

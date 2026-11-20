@@ -117,6 +117,16 @@ fn angle(v: Vec2) -> f32 {
     v.y.atan2(v.x)
 }
 
+/// Whether the path nearly turns back on itself from direction `u` to `v`. Only then can the
+/// short way between the two normals miss the outside of the bend, so only then is the sweep of
+/// a round join checked against the gap's middle. On a gentle bend the short way is always
+/// right, and the middle's direction (the difference of two nearly equal unit vectors) is too
+/// noisy to check against: zoomed far in on a wide line it sent the join the long way round,
+/// a whole disc where a sliver belonged.
+fn reverses(u: Vec2, v: Vec2) -> bool {
+    u.dot(v) < -0.5
+}
+
 /// Polygons covering a variable-width stroke of `lines` (output space), all positively wound
 /// like [`stroke_polygons`], so non-zero filling gives their union.
 ///
@@ -194,7 +204,7 @@ pub fn variable_polygons(lines: &[Polyline], hw: f32, profile: &WidthProfile, to
             let mut sweep = wrap(a1 - a0);
             let to_mid = wrap(am - a0);
             // Go round the side that passes through the gap's middle.
-            if to_mid * sweep < 0.0 || to_mid.abs() > sweep.abs() {
+            if reverses(u, v) && (to_mid * sweep < 0.0 || to_mid.abs() > sweep.abs()) {
                 sweep -= std::f32::consts::TAU.copysign(sweep);
             }
             out.extend(fan(p(at), a0, sweep, radius, radius));
@@ -471,7 +481,7 @@ fn join(p: Vec2, u: Vec2, v: Vec2, (l, r): (f32, f32), outline: &Outline) -> Opt
             let wrap = |x: f32| (x + std::f32::consts::PI).rem_euclid(std::f32::consts::TAU) - std::f32::consts::PI;
             let mut sweep = wrap(a1 - a0);
             let to_mid = wrap(am - a0);
-            if to_mid * sweep < 0.0 || to_mid.abs() > sweep.abs() {
+            if reverses(u, v) && (to_mid * sweep < 0.0 || to_mid.abs() > sweep.abs()) {
                 sweep -= std::f32::consts::TAU.copysign(sweep);
             }
             fan(p, a0, sweep, radius, radius)
@@ -656,7 +666,7 @@ pub fn outline_variable_strokes(dl: &DisplayList) -> std::borrow::Cow<'_, Displa
             items.push(DisplayItem { path: std::sync::Arc::new(outline), transform: Affine::IDENTITY, fill: Some(anicraft_doc::Paint::Solid(st.color)), stroke: None, fill_rule: anicraft_geom::FillRule::NonZero, image: None, ..it.clone() });
         }
     }
-    std::borrow::Cow::Owned(DisplayList { clip_modes: dl.clip_modes.clone(), items, clip_parents: dl.clip_parents.clone(), groups: dl.groups.clone() })
+    std::borrow::Cow::Owned(DisplayList { links: Vec::new(), clip_modes: dl.clip_modes.clone(), items, clip_parents: dl.clip_parents.clone(), groups: dl.groups.clone() })
 }
 
 #[cfg(test)]
@@ -673,6 +683,27 @@ mod tests {
         let polys = stroke_polygons(&[pl], 2.0);
         assert!(polys.len() >= 4);
         assert!(polys.iter().all(|p| signed_area(p) > 0.0));
+    }
+
+    #[test]
+    fn round_joins_on_gentle_bends_stay_slivers_however_far_in_the_view_is() {
+        // A gently curving dashed line, wide, as the stage flattens it at 100 % and at 6400 %:
+        // every join is a thin wedge on the outside of its bend, never most of a disc.
+        let path = anicraft_geom::Path::from_svg("M30 150C90 20 130 280 200 150C270 20 300 280 370 150").unwrap();
+        for zoom in [1.0f32, 24.0, 64.0] {
+            let lines = path.flatten(&Affine::scale(zoom, zoom), 0.1);
+            let hw = 5.5 * zoom;
+            let dash = [18.0 * zoom, 9.0 * zoom];
+            let outline = Outline { cap: Cap::Butt, join: Join::Round, miter_limit: 3.0, dash: Some((&dash, 0.0)) };
+            let taper = anicraft_doc::ProfilePreset::Bulge.profile().unwrap();
+            for polys in [styled_polygons(&lines, hw, &outline, None, None, false), variable_polygons(&lines, hw, &taper, None, false), styled_polygons(&lines, hw, &outline, Some(&taper), None, false)] {
+                assert!(polys.len() > 20);
+                for poly in polys.iter().filter(|p| p.len() != 4) {
+                    let a = signed_area(poly) / (zoom * zoom);
+                    assert!(a < 20.0, "a join of {a} px² at zoom {zoom} (a disc here is {} px²)", std::f32::consts::PI * 5.5 * 5.5);
+                }
+            }
+        }
     }
 
     #[test]

@@ -108,19 +108,76 @@ fn an_image_dropped_on_a_layers_frame_goes_into_a_keyframe_there_in_one_step() {
 }
 
 #[test]
-fn a_sound_dropped_on_a_frame_goes_onto_the_keyframe_holding_it() {
+fn a_sound_dropped_on_a_cell_starts_on_that_cell() {
     let dir = temp_dir("tlsnd");
-    let (_, _, wav, _) = media(&dir);
+    let wav = media(&dir).2;
+    // Inside a span: a keyframe is made at that cell. The sound starts there, and the drawing stays.
     let (mut s, layer) = timeline_session();
-    let v = run(&mut s, "file.drop", json!({"path": wav, "to": "timeline", "layer": layer.0, "frame": 7}));
+    let history = s.history_len();
+    let v = run(&mut s, "file.drop", json!({"path": &wav, "to": "timeline", "layer": layer.0, "frame": 7}));
+    assert_eq!(s.history_len(), history + 1, "one undo step");
+    assert_eq!(v["keyframe_made"].as_bool(), Some(true));
+    let l = s.timeline().layer(layer).unwrap();
+    assert_eq!(l.keyframes.len(), 2);
+    assert!(l.keyframes[0].start == 0 && l.keyframes[0].sound.is_none() && l.keyframes[0].elements.len() == 1, "the earlier keyframe keeps the drawing and does not take the sound");
+    let k = l.keyframe_at(7).unwrap();
+    assert!(k.start == 7 && k.sound.is_some() && k.elements.len() == 1, "the clip starts on the cell, and the drawing stays");
+    assert!(k.duration >= 12, "the new span covers the sound so its waveform can show, got {}", k.duration);
+    run(&mut s, "edit.undo", json!({}));
+    let l = s.timeline().layer(layer).unwrap();
+    assert_eq!(l.keyframes.len(), 1);
+    assert!(l.keyframes[0].sound.is_none() && s.doc.sounds.is_empty());
+    // The first cell of a keyframe, including frame 0: no split.
+    let v = run(&mut s, "file.drop", json!({"path": &wav, "to": "timeline", "layer": layer.0, "frame": 0}));
     assert_eq!(v["keyframe_made"].as_bool(), Some(false));
     let l = s.timeline().layer(layer).unwrap();
-    assert_eq!(l.keyframes.len(), 1, "no keyframe made for a sound");
-    assert!(l.keyframes[0].sound.is_some(), "onto the keyframe the frame is in");
+    assert_eq!(l.keyframes.len(), 1);
+    assert!(l.keyframes[0].sound.is_some());
     // Past the layer's end, a keyframe is made there for it.
-    run(&mut s, "file.drop", json!({"path": media(&dir).2, "to": "timeline", "layer": layer.0, "frame": 30}));
+    run(&mut s, "edit.undo", json!({}));
+    let v = run(&mut s, "file.drop", json!({"path": &wav, "to": "timeline", "layer": layer.0, "frame": 30}));
+    assert_eq!(v["keyframe_made"].as_bool(), Some(true));
     let l = s.timeline().layer(layer).unwrap();
     assert!(l.keyframe_at(30).is_some_and(|k| k.start == 30 && k.sound.is_some()));
+    assert!(l.keyframe_at(0).is_some_and(|k| k.sound.is_none()));
+}
+
+#[test]
+fn a_sound_dropped_on_a_raster_layer_joins_the_library_and_the_keyframe() {
+    let dir = temp_dir("tlraster");
+    let (png, _, wav, _) = media(&dir);
+    let mut s = Session::default();
+    let id = run(&mut s, "layer.new_raster", json!({}))["layer"].as_u64().unwrap();
+    let layer = anicraft_doc::LayerId(id);
+    assert_eq!(s.timeline().layer(layer).map(|l| l.kind), Some(anicraft_doc::LayerKind::Raster));
+    let history = s.history_len();
+    let v = run(&mut s, "file.drop", json!({"path": wav, "to": "timeline", "layer": layer.0, "frame": 0}));
+    assert_eq!(s.history_len(), history + 1, "one undo step");
+    assert_eq!(v["keyframe_made"].as_bool(), Some(false), "a sound uses the keyframe already there");
+    assert_eq!(s.doc.sounds.len(), 1, "the file is in the library");
+    assert_eq!(s.doc.sounds[0].name, "beep.wav");
+    let l = s.timeline().layer(layer).unwrap();
+    let k = &l.keyframes[0];
+    assert!(k.sound.as_ref().is_some_and(|fs| fs.sound == s.doc.sounds[0].id), "the keyframe references that library sound");
+    assert!(k.duration >= 12, "the span covers the sound so its waveform can show, got {}", k.duration);
+    assert!(s.timeline().layers.iter().filter(|l| l.id != layer).all(|l| l.keyframes.iter().all(|k| k.sound.is_none())), "the other layers are untouched");
+    // A picture on the same pixel layer is still paint, not a drop. Nothing more is imported.
+    let before = s.doc.clone();
+    let e = s.execute("file.drop", &json!({"path": png, "to": "timeline", "layer": layer.0, "frame": 0})).unwrap_err();
+    assert!(e.to_string().contains("pixel"), "{e}");
+    assert!(s.doc == before);
+    let mixed = dir.join("beep2.wav");
+    std::fs::copy(dir.join("beep.wav"), &mixed).unwrap();
+    let e = s.execute("file.drop", &json!({"paths": [dir.join("photo.png").display().to_string(), mixed.display().to_string()], "to": "timeline", "layer": layer.0, "frame": 0})).unwrap_err();
+    assert!(e.to_string().contains("pixel"), "{e}");
+    assert!(s.doc == before, "a picture beside a sound does not import either");
+    // Locked, including the pixel layer under the 2kool grid: still refused.
+    s.layer = layer;
+    run(&mut s, "layer.toggle_lock", json!({}));
+    let before = s.doc.clone();
+    let e = s.execute("file.drop", &json!({"path": mixed.display().to_string(), "to": "timeline", "layer": layer.0, "frame": 0})).unwrap_err();
+    assert!(e.to_string().contains("locked"), "{e}");
+    assert!(s.doc == before);
 }
 
 #[test]

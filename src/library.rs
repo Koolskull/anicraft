@@ -794,7 +794,7 @@ fn properties(app: &mut App, ui: &mut egui::Ui) {
                     .width(crate::theme::fit(ui, 150.0))
                     .selected_text(crate::panels::symbol_kind_label(kind))
                     .show_ui(ui, |ui| {
-                        for (k, key) in [(SymbolKind::Graphic, "graphic"), (SymbolKind::MovieClip, "movie_clip"), (SymbolKind::Button, "button")] {
+                        for (k, key) in [(SymbolKind::MovieClip, "movie_clip"), (SymbolKind::Button, "button"), (SymbolKind::Graphic, "graphic")] {
                             if ui.selectable_label(kind == k, crate::panels::symbol_kind_label(k)).clicked() && kind != k {
                                 app.run("symbol.set_kind", json!({"symbol": id.0, "kind": key}));
                             }
@@ -931,7 +931,7 @@ fn symbol_frame(doc: &Document, id: anicraft_engine::doc::SymbolId) -> anicraft_
             name: String::new(),
             transform: Default::default(),
             color: Default::default(),
-            kind: ElementKind::Symbol { symbol: id, loop_mode: LoopMode::SingleFrame, first_frame: 0, blend: Default::default(), filters: Vec::new(), events: Vec::new() },
+            kind: ElementKind::Symbol { symbol: id, loop_mode: LoopMode::SingleFrame, first_frame: 0, blend: Default::default(), filters: Vec::new(), events: Vec::new(), pivot: None },
         })];
     }
     let mut scene = Scene::new("");
@@ -956,7 +956,7 @@ fn waveform(app: &App, ui: &egui::Ui, r: Rect, id: anicraft_engine::doc::SoundId
     for c in 0..cols {
         let a = c * len / cols;
         let b = ((c + 1) * len / cols).max(a + 1).min(len);
-        if let Some((lo, hi)) = dec.peaks.range(a, b) {
+        if let Some((lo, hi)) = dec.peaks.extent(&dec.pcm, a, b) {
             let x = r.left() + c as f32 + 0.5;
             ui.painter().line_segment([pos2(x, cy - hi.clamp(-1.0, 1.0) * half), pos2(x, cy - lo.clamp(-1.0, 1.0) * half)], stroke);
         }

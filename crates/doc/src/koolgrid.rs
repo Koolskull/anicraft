@@ -112,7 +112,7 @@ pub fn place(doc: &mut Document) -> Result<LayerId, &'static str> {
 
     let instance = element(
         inst_id,
-        ElementKind::Symbol { symbol: sym_id, loop_mode: LoopMode::SingleFrame, first_frame: 0, blend: BlendMode::Multiply, filters: Vec::new(), events: Vec::new() },
+        ElementKind::Symbol { symbol: sym_id, loop_mode: LoopMode::SingleFrame, first_frame: 0, blend: BlendMode::Multiply, filters: Vec::new(), events: Vec::new(), pivot: None },
         ColorEffect::Alpha(LAYER_ALPHA),
     );
     let mut grid = Layer::new(grid_id, LAYER_NAME);

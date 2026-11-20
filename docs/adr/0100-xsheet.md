@@ -1,7 +1,7 @@
 # ADR 0100: The X-sheet is the timeline, stood up
 
 * Status: accepted (2026-11-15)
-* Relates to: ADR 0075 (docks), ADR 0065 (drops on a frame), ADR 0099 (studio chrome)
+* Relates to: ADR 0075 (docks), ADR 0065 (drops on a frame), ADR 0099 (studio chrome), ADR 0120 (a sound on the cell)
 
 ## Context
 
@@ -24,7 +24,8 @@ from the film the stage is playing.
 3. **Audio is a sound on the cell.** Right-click places or removes a Library sound
    with `sound.place` and `sound.remove`. A file dropped on a column lands on that
    layer and frame, the same route as a drop on the filmstrip, and only when the
-   pointer is actually over a column.
+   pointer is actually over a column. A sound draws its waveform down the span,
+   the same picture the filmstrip draws across it.
 
 ## Consequences
 

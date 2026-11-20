@@ -88,7 +88,7 @@ pub fn show(app: &mut App, ctx: &egui::Context) {
     let Some(t) = target(app, &ed) else { return };
     let mut open = true;
     let title = tr!("Edit Envelope — {name}", name = t.sound.name);
-    let shown = egui::Window::new(title.clone())
+    let shown = crate::windows::new(ctx, title.clone())
         .id(egui::Id::new("envelope_editor"))
         .open(&mut open)
         .collapsible(false)
@@ -209,7 +209,7 @@ fn body(app: &mut App, ed: &mut EnvelopeEditor, ui: &mut egui::Ui, t: &Target) {
         if let Some(pk) = &peaks
             && let Some(pk) = pk.get(c)
         {
-            draw_wave(&p, *lane, pk, &t.sound, t, from, window);
+            draw_wave(&p, *lane, pk, &t.sound, c, t, from, window);
         }
         p.text(lane.left_top() + vec2(6.0, 4.0), Align2::LEFT_TOP, if c == 0 { trc!("left channel", "L") } else { trc!("right channel", "R") }, font(Type::Label), T.text_dim);
         // The envelope: its level before the first point and after the last, lines between.
@@ -375,7 +375,8 @@ fn channel_peaks(ed: &mut EnvelopeEditor, sound: &Sound) -> Option<Arc<[Peaks; 2
 
 /// One channel's waveform over seconds `from .. from + window` of the sound's time (repeats
 /// wrap to its start), as far as it is heard.
-fn draw_wave(p: &egui::Painter, lane: Rect, peaks: &Peaks, sound: &Sound, t: &Target, from: f64, window: f64) {
+fn draw_wave(p: &egui::Painter, lane: Rect, peaks: &Peaks, sound: &Sound, channel: usize, t: &Target, from: f64, window: f64) {
+    let Some(dec) = sound.decoded_if_ready() else { return };
     let len = peaks.frames() as u64;
     if len == 0 {
         return;
@@ -395,9 +396,9 @@ fn draw_wave(p: &egui::Painter, lane: Rect, peaks: &Peaks, sound: &Sound, t: &Ta
         let b = b.max(a + 1).min(heard);
         let (s, n) = ((a % len) as usize, (b - a).min(len) as usize);
         let range = if s + n <= len as usize {
-            peaks.range(s, s + n)
+            peaks.extent_channel(&dec.pcm, channel, s, s + n)
         } else {
-            match (peaks.range(s, len as usize), peaks.range(0, s + n - len as usize)) {
+            match (peaks.extent_channel(&dec.pcm, channel, s, len as usize), peaks.extent_channel(&dec.pcm, channel, 0, s + n - len as usize)) {
                 (Some((l1, h1)), Some((l2, h2))) => Some((l1.min(l2), h1.max(h2))),
                 (one, other) => one.or(other),
             }

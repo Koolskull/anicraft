@@ -160,8 +160,9 @@ span.
 ### Waveforms on the timeline
 
 The timeline draws each sound's waveform over its frames, so you can line up keys with beats
-and syllables. The waveform follows the sound's effect, so a fade-out shows as a shrinking
-wave.
+and syllables. The file's name sits on the wave in white with a thin black edge. A close view
+shows the shape of the samples. The waveform follows the sound's effect, so a fade-out shows
+as a shrinking wave. The X-sheet draws the same wave down the span, with the same name.
 
 ### Effects and the envelope
 
@@ -242,4 +243,3 @@ Lottie animations carry no sound. See [Exporting and Publish](exporting-and-publ
 
 * Picking a colour from a bitmap's pixels with the Eyedropper.
 * Panning beyond what the envelope does.
-* Sound playback in the web version.

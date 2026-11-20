@@ -38,3 +38,10 @@ has to renumber because another PR merged first.
 | 0116 | feat/raster-layer | Raster spray, paper grain, and a pencil on its side |
 | 0117 | feat/raster-layer | Spray pictures stamped and turned |
 | 0118 | feat/raster-layer | Live raster ink stays smooth under the 2kool grid |
+| 0119 | feat/raster-layer | Raster strokes keep pen samples; scene tiles draw the ink |
+| 0120 | feat/raster-layer | A sound dropped on a timeline cell starts there, and Delete takes the clip off |
+| 0121 | feat/raster-layer | Timeline show, lock, outline and onion toggles are a touch target |
+| 0122 | feat/raster-layer | The file name sits on the waveform, and a close view shows the samples |
+| 0123 | feat/raster-layer | Layer properties are in the Properties panel |
+| 0124 | feat/raster-layer | Layer properties are square modules and dials |
+| 0125 | feat/raster-layer | Raster tool properties use the same modules and dials |

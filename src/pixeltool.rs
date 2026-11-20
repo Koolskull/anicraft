@@ -247,6 +247,9 @@ pub fn unit(pressure: Option<f32>) -> f32 {
 pub fn begin(app: &mut App, p: Vec2, pressure: Option<f32>) -> Drag {
     let pressure = unit(pressure);
     app.s.begin_gesture(if app.pixel.smudge { tr_noop!("Smudge") } else { tr_noop!("Paint Pixels") });
+    app.pixel_queue.clear();
+    app.pixel_span = None;
+    grow_span(app, p.x, p.y);
     let pending = lays_on_its_side(app);
     if !pending {
         let sample = Sample { x: p.x, y: p.y, pressure };
@@ -268,33 +271,94 @@ pub fn tap(app: &mut App, p: Vec2, pressure: Option<f32>) {
     let _ = stamp(app, &[Sample { x: p.x, y: p.y, pressure: unit(pressure) }], false);
 }
 
+/// How many new samples one frame stamps. The rest stay queued so a hitch cannot
+/// walk a whole custom brush in one go (ADR 0119).
+pub const STAMPS_PER_FRAME: usize = 24;
+
 /// Dabs from the last sample to `to`. Spacing happens once, in the command.
 /// The first move of a pencil paints the press as well, aimed along this step.
 pub fn move_to(app: &mut App, from: (f32, f32, f32), to: egui::Pos2, pressure: Option<f32>) {
-    let pressure = unit(pressure);
-    let pending = matches!(app.drag, Drag::Pixel { pending: true, .. });
-    let from_s = Sample { x: from.0, y: from.1, pressure: from.2 };
-    let to_s = Sample { x: to.x, y: to.y, pressure };
-    let moved = (to_s.x - from_s.x).abs() > 0.01 || (to_s.y - from_s.y).abs() > 0.01;
-    let leaned = (to_s.pressure - from_s.pressure).abs() > 0.001;
-    if moved || leaned {
-        if !stamp(app, &[from_s, to_s], !pending) {
-            app.s.end_gesture();
-            app.drag = Drag::None;
-            return;
-        }
-        app.drag = Drag::Pixel { x: to.x, y: to.y, pressure, pending: false };
-    } else {
-        app.drag = Drag::Pixel { x: to.x, y: to.y, pressure, pending };
+    if !matches!(app.drag, Drag::Pixel { .. }) {
+        app.drag = Drag::Pixel { x: from.0, y: from.1, pressure: from.2, pending: false };
     }
+    feed(app, &[Sample { x: to.x, y: to.y, pressure: unit(pressure) }]);
+}
+
+/// Queue `fresh` (stage space) and stamp a bounded run. The pen-up path calls [`finish`],
+/// which stamps whatever is still queued.
+pub fn feed(app: &mut App, fresh: &[Sample]) {
+    if !matches!(app.drag, Drag::Pixel { .. }) {
+        return;
+    }
+    for sample in fresh {
+        if !sample.x.is_finite() || !sample.y.is_finite() {
+            continue;
+        }
+        let pressure = if sample.pressure.is_finite() { sample.pressure.clamp(0.0, 1.0) } else { 1.0 };
+        let same = |x: f32, y: f32, p: f32| (x - sample.x).abs() <= 0.01 && (y - sample.y).abs() <= 0.01 && (p - pressure).abs() <= 0.001;
+        let dup = app.pixel_queue.last().is_some_and(|&(x, y, p)| same(x, y, p))
+            || (app.pixel_queue.is_empty() && matches!(app.drag, Drag::Pixel { x, y, pressure: p, .. } if same(x, y, p)));
+        if dup {
+            continue;
+        }
+        app.pixel_queue.push((sample.x, sample.y, pressure));
+        grow_span(app, sample.x, sample.y);
+    }
+    let _ = flush(app, STAMPS_PER_FRAME);
 }
 
 /// Ends the drag. A pencil press that never moved lays a round dab.
+/// Samples still queued are stamped first, so the end of the line is in the plate.
 pub fn finish(app: &mut App) {
+    while !app.pixel_queue.is_empty() {
+        if !flush(app, app.pixel_queue.len()) {
+            break;
+        }
+    }
     if let Drag::Pixel { x, y, pressure, pending: true } = app.drag {
+        grow_span(app, x, y);
         let _ = stamp(app, &[Sample { x, y, pressure }], false);
     }
+    app.pixel_queue.clear();
     app.s.end_gesture();
+}
+
+fn grow_span(app: &mut App, x: f32, y: f32) {
+    let pad = app.pixel.size.abs().max(app.pixel.size_min.abs()) * 0.5 + 4.0;
+    if !pad.is_finite() {
+        return;
+    }
+    let (x0, y0, x1, y1) = (x - pad, y - pad, x + pad, y + pad);
+    app.pixel_span = Some(match app.pixel_span {
+        Some([a, b, c, d]) => [a.min(x0), b.min(y0), c.max(x1), d.max(y1)],
+        None => [x0, y0, x1, y1],
+    });
+}
+
+/// Stamp up to `limit` queued samples. The drag's point is the last one that landed.
+fn flush(app: &mut App, limit: usize) -> bool {
+    let Drag::Pixel { x, y, pressure, pending } = app.drag else { return false };
+    let n = limit.min(app.pixel_queue.len());
+    if n == 0 {
+        return true;
+    }
+    let mut samples = Vec::with_capacity(n + 1);
+    samples.push(Sample { x, y, pressure });
+    let taken: Vec<(f32, f32, f32)> = app.pixel_queue.drain(..n).collect();
+    for (sx, sy, sp) in taken {
+        samples.push(Sample { x: sx, y: sy, pressure: sp });
+        grow_span(app, sx, sy);
+    }
+    if !stamp(app, &samples, !pending) {
+        app.s.end_gesture();
+        app.drag = Drag::None;
+        app.pixel_queue.clear();
+        return false;
+    }
+    if let Some(last) = samples.last() {
+        app.drag = Drag::Pixel { x: last.x, y: last.y, pressure: last.pressure, pending: false };
+    }
+    true
 }
 
 /// The fill colour, alpha included, so the colour picker's Alpha is the stroke's opacity.
@@ -434,6 +498,44 @@ mod tests {
     }
 
     #[test]
+    fn a_hook_is_ink_and_the_straight_chord_is_not() {
+        let ctx = egui::Context::default();
+        let mut app = App::with_context(&ctx, Session::new(sample::demo()), Some(std::path::PathBuf::from("unused.png")));
+        app.run("doc.set_stage", json!({"width": 64, "height": 48})).expect("stage");
+        app.s.style.set_fill_color(anicraft_engine::doc::Rgba::new(1.0, 0.0, 0.0, 1.0));
+        app.pixel.size = 3.0;
+        app.pixel.size_min = 3.0;
+        app.pixel.fringe = 0.0;
+        app.pixel.softness = 0.0;
+        app.drag = begin(&mut app, Vec2::new(8.0, 8.0), None);
+        feed(&mut app, &[Sample { x: 8.0, y: 28.0, pressure: 1.0 }, Sample { x: 40.0, y: 28.0, pressure: 1.0 }]);
+        finish(&mut app);
+        assert!(alpha_at(&app, 8, 28) > 200, "the corner of the hook is ink");
+        assert_eq!(alpha_at(&app, 24, 18), 0, "a chord from the press to the end would have painted here");
+    }
+
+    #[test]
+    fn a_long_move_stamps_the_start_and_keeps_the_tail() {
+        let ctx = egui::Context::default();
+        let mut app = App::with_context(&ctx, Session::new(sample::demo()), Some(std::path::PathBuf::from("unused.png")));
+        app.run("doc.set_stage", json!({"width": 80, "height": 24})).expect("stage");
+        app.s.style.set_fill_color(anicraft_engine::doc::Rgba::new(1.0, 0.0, 0.0, 1.0));
+        app.pixel.size = 2.0;
+        app.pixel.size_min = 2.0;
+        app.pixel.fringe = 0.0;
+        app.pixel.softness = 0.0;
+        app.drag = begin(&mut app, Vec2::new(2.0, 10.0), None);
+        let pts: Vec<Sample> = (0..40).map(|i| Sample { x: 4.0 + i as f32, y: 10.0, pressure: 1.0 }).collect();
+        feed(&mut app, &pts);
+        assert!(alpha_at(&app, 4, 10) > 0, "the first queued sample is ink");
+        assert_eq!(alpha_at(&app, 43, 10), 0, "the tail waits for the next frame");
+        assert!(!app.pixel_queue.is_empty());
+        finish(&mut app);
+        assert!(alpha_at(&app, 43, 10) > 0, "lifting the pen stamps the rest");
+        assert!(app.pixel_queue.is_empty());
+    }
+
+    #[test]
     fn stretch_defaults_dry_and_never_reaches_a_full_replace() {
         assert!(STRETCH_DEFAULT < 0.5);
         assert_eq!(stretch_strength(0.0), 0.0);
@@ -514,5 +616,56 @@ mod tests {
         assert_eq!(air.len(), ink.len());
         let peak = |buf: &[u8]| buf.iter().skip(3).step_by(4).copied().max().unwrap_or(0);
         assert!(peak(&ink) > 200, "ink preview peak {}", peak(&ink));
+    }
+
+    #[test]
+    fn the_raster_properties_are_dials_in_one_band() {
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+        let mut app = App::with_context(&ctx, Session::new(anicraft_engine::doc::Document::default()), Some(std::path::PathBuf::from("unused.png")));
+        app.tool = Tool::Pixel;
+        let screen = egui::RawInput { screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1600.0, 940.0))), ..Default::default() };
+        let mut nodes = Vec::new();
+        for _ in 0..3 {
+            let mut out = ctx.run_ui(screen.clone(), |ui| app.frame(ui));
+            out.textures_delta.clear();
+            if let Some(update) = out.platform_output.accesskit_update {
+                nodes = update.nodes;
+            }
+        }
+        let names: Vec<String> = nodes.iter().filter_map(|(_, n)| n.label().map(str::to_string)).collect();
+        for need in ["Fill colour", "Pressure opacity", "Erase", "Smudge", "Pixel brush antialias", "Pixel brush size", "Pixel brush thinnest", "Raster flow", "Pixel brush softness", "Raster spray", "Raster grain", "Raster pencil lay"] {
+            assert!(names.iter().any(|n| n == need), "missing {need} in {names:?}");
+        }
+        assert!(!names.iter().any(|n| n == "Minimum opacity" || n == "Paint stretch"), "pressure range and stretch stay hidden until those modes are on: {names:?}");
+        let box_of = |label: &str| -> (f64, f64, f64, f64) {
+            nodes.iter().find(|(_, n)| n.label() == Some(label)).and_then(|(_, n)| n.bounds()).map(|b| (b.x0, b.y0, b.x1, b.y1)).unwrap_or_else(|| panic!("no bounds for {label}"))
+        };
+        let size = box_of("Pixel brush size");
+        let spray = box_of("Raster spray");
+        let aa = box_of("Pixel brush antialias");
+        let width = |b: (f64, f64, f64, f64)| b.2 - b.0;
+        let dial_w = width(size);
+        assert!(dial_w >= 56.0 && dial_w <= 84.0, "a raster dial stays the large size, got {dial_w}");
+        assert!((width(spray) - dial_w).abs() < 1.0, "spray is a dial like size");
+        let expect = ((dial_w - 4.0) * 0.5).max(28.0);
+        assert!((width(aa) - expect).abs() < 1.5, "antialias is a small square: {} vs {expect}", width(aa));
+        let ys = [size.1, spray.1, aa.1];
+        let span = ys.iter().copied().fold(f64::MIN, f64::max) - ys.iter().copied().fold(f64::MAX, f64::min);
+        assert!(span < 280.0, "the raster face is a short band, not a tall form: span {span}");
+
+        app.pixel.pressure_opacity = true;
+        app.pixel.smudge = true;
+        for _ in 0..2 {
+            let mut out = ctx.run_ui(screen.clone(), |ui| app.frame(ui));
+            out.textures_delta.clear();
+            if let Some(update) = out.platform_output.accesskit_update {
+                nodes = update.nodes;
+            }
+        }
+        let names: Vec<String> = nodes.iter().filter_map(|(_, n)| n.label().map(str::to_string)).collect();
+        assert!(names.iter().any(|n| n == "Minimum opacity") && names.iter().any(|n| n == "Maximum opacity"), "pressure opens its range: {names:?}");
+        assert!(names.iter().any(|n| n == "Paint stretch"), "smudge opens stretch: {names:?}");
+        assert!(!names.iter().any(|n| n == "Raster spray"), "smudge hides the mark dials: {names:?}");
     }
 }

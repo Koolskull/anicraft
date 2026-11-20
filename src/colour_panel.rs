@@ -91,7 +91,7 @@ fn from_bytes(c: [u8; 4]) -> Rgba {
 
 /// Paints `paint` into `r`: a colour, a gradient's ramp, a bitmap's mark, or the empty field
 /// with a slash for no fill.
-fn paint_preview(p: &egui::Painter, r: Rect, paint: Option<&Paint>) {
+pub(crate) fn paint_preview(p: &egui::Painter, r: Rect, paint: Option<&Paint>) {
     match paint {
         None => {
             p.rect_filled(r, 0.0, T.field);
@@ -149,7 +149,8 @@ pub fn popup_for(ui: &egui::Ui, anchor: &Response, popup: Id, paint: Option<&Pai
         crate::colour::new_session(ui.ctx());
     }
     let mut edit = None;
-    let shown = egui::Popup::menu(anchor).id(popup).close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside).show(|ui| {
+    // A click on the stage while this is open picks a colour there (the picker's eyedropper).
+    let shown = egui::Popup::menu(anchor).id(popup).close_behavior(crate::colour::close_behavior(ui.ctx())).show(|ui| {
         edit = fill_picker(ui, popup, paint, bitmaps);
     });
     if let Some(r) = shown {
@@ -625,15 +626,12 @@ mod tests {
         ctx.enable_accesskit();
         let mut app = App::with_context(&ctx, anicraft_engine::Session::default(), Some(PathBuf::from("unused.png")));
         app.run("draw.rect", json!({"x": 10, "y": 10, "w": 40, "h": 30, "fill": "#ff000080", "stroke": null}));
-        let kept = match current(&app).0 {
-            Paint::Solid(c) => (c.a - 128.0 / 255.0).abs() < 1e-3,
-            _ => false,
-        };
-        assert!(kept, "a solid fill keeps its alpha: {:?}", current(&app).0);
+        let Paint::Solid(c) = current(&app).0 else { panic!("a solid fill"); };
+        assert!((c.a - 128.0 / 255.0).abs() < 1e-3, "{c:?}");
         app.run("paint.set_fill", json!({"type": "linear", "stops": [{"offset": 0, "color": "#ff0000"}, {"offset": 1, "color": "#0000ff00"}]}));
         let paint = current(&app).0;
-        let stops = paint.stops().unwrap_or(&[]);
-        assert!(stops.len() == 2 && (stops[0].color.a - 1.0).abs() < 1e-3 && stops[1].color.a < 1e-3, "{stops:?}");
+        let stops = paint.stops().expect("a gradient");
+        assert!((stops[0].color.a - 1.0).abs() < 1e-3 && stops[1].color.a < 1e-3, "{stops:?}");
         app.run("paint.set_fill", json!({"type": "solid", "color": "#3d8bfd80"}));
         app.tool = Tool::Select;
         app.open_fill_swatch = true;

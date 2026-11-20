@@ -101,7 +101,7 @@ are not used for UI text, because they would change metrics per OS.
 * **Checkboxes and radio buttons** go through `theme::checkbox` / `theme::radio_value`, which
   give them a visible edge (`control_edge`) so the off state does not disappear.
 * **Click targets** (WCAG 2.5.8): at least `theme::TARGET` (28 px) for every button, row and
-  field; tools `TOOL_BUTTON` (40 × 40); timeline rows 28; layer toggles 24 × 24; dialog
+  field; tools `TOOL_BUTTON` (40 × 40); timeline rows 48; layer toggles 44 × 44 (ADR 0121); dialog
   buttons 32 high. Don't use small buttons. Timeline frame cells (12 px wide) are a
   dense-data exception: the ruler, rows and the keyboard reach the same frames.
 * Item spacing 8×6, buttons pad 10×5. Panels pad 10–12 px. Align values in a column using the

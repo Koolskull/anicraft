@@ -1,7 +1,9 @@
 //! Vertical X-sheet (ADR 0100): the timeline stood on its end.
 //!
 //! Rows are frames and columns are layers, on the same playhead and the same keyframes as the
-//! filmstrip below the stage. A cell's menu is the timeline's frame menu, plus placing a sound
+//! filmstrip below the stage. A sound draws its waveform down the span, the same picture the
+//! filmstrip draws across it, and the file name in white with a black edge on top of that wave.
+//! A cell's menu is the timeline's frame menu, plus placing a sound
 //! from the Library. Nothing here is a second clock.
 
 use crate::a11y;
@@ -162,23 +164,35 @@ fn paint_cells(ui: &egui::Ui, app: &App, layers: &[Arc<Layer>], cols: &[LayerId]
         }
         for f in f0..=f1 {
             let cell = Rect::from_min_size(pos2(x, content.top() + f as f32 * ROW_H), vec2(COL_W, ROW_H));
-            paint_cell(p, app, layers, i, layer, f, cell, names, folder);
+            paint_cell(p, app, layer, f, cell, folder);
+        }
+        if !folder {
+            paint_waves(ui, p, app, layer, x, content, f0, f1);
+        }
+        for f in f0..=f1 {
+            let cell = Rect::from_min_size(pos2(x, content.top() + f as f32 * ROW_H), vec2(COL_W, ROW_H));
+            // The name and the selection sit on top of the waveform.
+            if !folder {
+                paint_sound_name(p, app, layer, f, cell, names);
+            }
+            if app.frame_sel.is_some_and(|s| s.contains(layers, i, f)) {
+                p.rect_stroke(cell.shrink(1.0), 0.0, Stroke::new(2.0, T.selection), StrokeKind::Inside);
+            }
         }
         p.vline(x + COL_W - 0.5, clip.y_range().intersection(content.y_range()), Stroke::new(1.0, T.separator));
     }
     drop_cols
 }
 
-#[allow(clippy::too_many_arguments)]
-fn paint_cell(p: &egui::Painter, app: &App, layers: &[Arc<Layer>], i: usize, layer: &Layer, f: u32, cell: Rect, names: &[(u64, String)], folder: bool) {
+fn paint_cell(p: &egui::Painter, app: &App, layer: &Layer, f: u32, cell: Rect, folder: bool) {
     let play = f == app.s.frame;
     if folder {
         p.rect_filled(cell, 0.0, if play { T.row_selected } else { T.panel_alt });
         return;
     }
     let k = layer.keyframe_at(f);
-    let (fill, ink, letter, key, empty, sound) = match k {
-        None => (if play { T.row_selected } else { T.panel }, if play { T.on_selected } else { T.text_faint }, None, false, true, None),
+    let (fill, ink, letter, key, empty) = match k {
+        None => (if play { T.row_selected } else { T.panel }, if play { T.on_selected } else { T.text_faint }, None, false, true),
         Some(k) => {
             let ki = layer.keyframe_index_at(f).unwrap_or(0);
             let next = layer.keyframes.get(ki + 1).is_some_and(|n| n.start == k.end());
@@ -213,9 +227,7 @@ fn paint_cell(p: &egui::Painter, app: &App, layers: &[Arc<Layer>], i: usize, lay
             } else {
                 T.ink
             };
-            let sound = (k.start == f).then_some(k.sound.as_ref()).flatten().and_then(|fs| names.iter().find(|(id, _)| *id == fs.sound.0).map(|(_, n)| n.clone()));
-            let held = k.sound.is_some() && k.start != f;
-            (if play { T.row_selected } else { fill }, ink, letter, f == k.start, empty, sound.or_else(|| held.then(String::new)))
+            (if play { T.row_selected } else { fill }, ink, letter, f == k.start, empty)
         }
     };
     p.rect_filled(cell, 0.0, fill);
@@ -237,24 +249,55 @@ fn paint_cell(p: &egui::Painter, app: &App, layers: &[Arc<Layer>], i: usize, lay
         } else {
             p.circle_filled(c, 4.0, ink);
         }
-    } else if letter.is_some() || sound.as_ref().is_some_and(|s| s.is_empty()) {
-        // A held frame of a tween or a sound: a short tick, as a tracker leaves the row blank
-        // once the note has started.
+    } else if letter.is_some() {
+        // A held frame of a tween: a short tick. A sound's held frames carry the waveform
+        // instead, drawn across the span after these cells.
         let c = pos2(cell.left() + 14.0, cell.center().y);
         p.vline(c.x, (c.y - 5.0)..=(c.y + 5.0), Stroke::new(1.5, ink));
     }
     if let Some(ch) = letter {
         p.text(pos2(cell.left() + 24.0, cell.center().y), Align2::LEFT_CENTER, ch.to_string(), font(Type::Data), ink);
     }
-    if let Some(name) = sound.as_ref().filter(|s| !s.is_empty()) {
-        let icon = Rect::from_center_size(pos2(cell.right() - 12.0, cell.center().y), vec2(12.0, 12.0));
-        icons::paint(p, icon, Icon::Sound, if play { T.on_selected } else { T.waveform });
-        let galley = elide(p, name, font(Type::Caption), ink, (cell.width() - 40.0).max(4.0));
-        p.galley(pos2(cell.left() + 36.0, cell.center().y - galley.size().y * 0.5), galley, ink);
+}
+
+/// The waveform down one column, for every sounding keyframe that crosses the rows on screen.
+/// `false` from the painter means the sound is still being decoded.
+fn paint_waves(ui: &egui::Ui, p: &egui::Painter, app: &App, layer: &Layer, x: f32, content: Rect, f0: u32, f1: u32) {
+    for (ki, k) in layer.keyframes.iter().enumerate() {
+        let Some(fs) = k.sound.as_ref() else { continue };
+        if k.end() <= f0 || k.start > f1 {
+            continue;
+        }
+        let y0 = content.top() + k.start as f32 * ROW_H;
+        let y1 = content.top() + k.end() as f32 * ROW_H;
+        // Leave the key mark. The name is drawn over the wave afterwards.
+        let span = Rect::from_min_max(pos2(x + 26.0, y0), pos2(x + COL_W - 3.0, y1));
+        let next = layer.keyframes.get(ki + 1).is_some_and(|n| n.start == k.end());
+        let motion = k.motion.is_some();
+        let tweened = k.tween.is_some() && next && !motion;
+        let color = if layer.muted {
+            T.text_faint
+        } else if !k.has_content() && !tweened {
+            T.waveform
+        } else {
+            T.ink
+        };
+        if !timeline::waveform(p, &app.s.doc, fs, k, span, timeline::WaveAxis::Down { origin: y0, cell: ROW_H }, color) {
+            ui.ctx().request_repaint_after(std::time::Duration::from_millis(100));
+        }
     }
-    if app.frame_sel.is_some_and(|s| s.contains(layers, i, f)) {
-        p.rect_stroke(cell.shrink(1.0), 0.0, Stroke::new(2.0, T.selection), StrokeKind::Inside);
-    }
+}
+
+/// The sound's name on the keyframe that starts it, over the waveform: white, 1 px black edge.
+fn paint_sound_name(p: &egui::Painter, app: &App, layer: &Layer, f: u32, cell: Rect, names: &[(u64, String)]) {
+    let Some(k) = layer.keyframe_at(f).filter(|k| k.start == f) else { return };
+    let Some(name) = k.sound.as_ref().and_then(|fs| names.iter().find(|(id, _)| *id == fs.sound.0).map(|(_, n)| n.as_str())) else { return };
+    let play = f == app.s.frame;
+    let icon = Rect::from_center_size(pos2(cell.right() - 12.0, cell.center().y), vec2(12.0, 12.0));
+    icons::paint(p, icon, Icon::Sound, if play { T.on_selected } else { T.waveform });
+    let left = cell.left() + 36.0;
+    let area = Rect::from_min_max(pos2(left, cell.top()), pos2(left + (cell.width() - 40.0).max(4.0), cell.bottom()));
+    timeline::clip_name(p, area, name);
 }
 
 /// The span colour the horizontal timeline would use, kept as a bar on the white playhead row
@@ -305,7 +348,7 @@ fn cells_pointer(app: &mut App, ui: &egui::Ui, resp: &egui::Response, layers: &[
             None => app.frame_sel = Some(FrameSel::cell(id, f)),
         }
     } else if resp.clicked() || resp.drag_started() {
-        let whole = layers.iter().find(|l| l.id == id).and_then(|l| timeline::whole_motion_span(l, f));
+        let whole = layers.iter().find(|l| l.id == id).and_then(|l| timeline::whole_motion_span(l, f).or_else(|| timeline::whole_sound_span(l, f)));
         app.frame_sel = Some(whole.filter(|_| !ctrl).unwrap_or_else(|| FrameSel::cell(id, f)));
     }
     app.playing = false;
@@ -426,16 +469,12 @@ fn cell_menu(app: &mut App, ui: &mut egui::Ui) {
     timeline::frame_menu(app, ui);
     ui.separator();
     let frame = app.s.frame;
-    let Some((id, folder, sounding)) = app.s.active_layer().map(|l| (l.id.0, l.kind == LayerKind::Folder, l.keyframe_at(frame).is_some_and(|k| k.sound.is_some()))) else {
+    let Some((id, folder)) = app.s.active_layer().map(|l| (l.id.0, l.kind == LayerKind::Folder)) else {
         return;
     };
     if folder {
         ui.add_enabled(false, egui::Button::new(tr!("Sounds go on a layer, not a folder")));
         return;
-    }
-    if sounding && ui.button(tr!("Remove Sound")).clicked() {
-        app.run("sound.remove", json!({"layer": id, "frame": frame}));
-        ui.close();
     }
     let sounds: Vec<(u64, String)> = app.s.doc.sounds.iter().map(|s| (s.id.0, s.name.clone())).collect();
     if sounds.is_empty() {
@@ -450,6 +489,86 @@ fn cell_menu(app: &mut App, ui: &mut egui::Ui) {
             }
         }
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::app::App;
+
+    fn paint(ctx: &egui::Context, app: &mut App) -> Vec<egui::epaint::ClippedShape> {
+        let input = egui::RawInput { screen_rect: Some(Rect::from_min_size(egui::Pos2::ZERO, vec2(1600.0, 940.0))), ..Default::default() };
+        let mut out = ctx.run_ui(input, |ui| app.frame(ui));
+        out.textures_delta.clear();
+        out.shapes
+    }
+
+    fn settle(ctx: &egui::Context, app: &mut App) -> Vec<egui::epaint::ClippedShape> {
+        let mut shapes = Vec::new();
+        for _ in 0..4 {
+            shapes = paint(ctx, app);
+        }
+        shapes
+    }
+
+    /// A wave on the sheet is a short horizontal stroke. A cell rule is a full column wide,
+    /// and the filmstrip's wave stands upright, so neither of those counts.
+    fn wave_marks(shapes: &[egui::epaint::ClippedShape]) -> usize {
+        shapes
+            .iter()
+            .filter(|cs| {
+                let egui::epaint::Shape::LineSegment { points, .. } = &cs.shape else { return false };
+                let dx = (points[0].x - points[1].x).abs();
+                let dy = (points[0].y - points[1].y).abs();
+                dy < 0.51 && (2.0..40.0).contains(&dx)
+            })
+            .count()
+    }
+
+    #[test]
+    fn a_sound_draws_its_waveform_down_the_column() {
+        let ctx = egui::Context::default();
+        let mut app = App::with_context(&ctx, anicraft_engine::Session::default(), Some(std::path::PathBuf::from("unused.png")));
+        app.show_panel(crate::dock::Panel::XSheet);
+        let layer = app.s.layer;
+        app.run("timeline.insert_frame", json!({"layer": layer.0, "frame": 0, "count": 11}));
+        let quiet = wave_marks(&settle(&ctx, &mut app));
+        assert!(app.xsheet_hit.is_some(), "the sheet is on screen");
+
+        let dir = std::env::temp_dir().join(format!("anicraft-xwave-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let wav = dir.join("beep.wav");
+        let bytes = anicraft_engine::doc::audio::wav::encode(8000, 1, &[0.25; 4000], anicraft_engine::doc::audio::wav::Bits::Int16);
+        assert!(std::fs::write(&wav, bytes).is_ok(), "the test tone can be written");
+        let dropped = app.run("file.drop", json!({"path": wav.display().to_string(), "to": "timeline", "layer": layer.0, "frame": 0}));
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(dropped.is_some(), "the sound lands on the keyframe");
+        let sounding = app.s.timeline().layer(layer).and_then(|l| l.keyframes.first()).is_some_and(|k| k.sound.is_some() && k.duration >= 12);
+        assert!(sounding, "the clip covers the tone");
+
+        let loud = wave_marks(&settle(&ctx, &mut app));
+        assert!(loud > quiet + 20, "the sheet draws the wave down the span: {quiet} quiet, {loud} with the sound");
+        assert!(outlined_file_name(&settle(&ctx, &mut app), "beep.wav"), "the file name is white with a 1 px black edge");
+    }
+
+    /// White letters for `name`, and a black copy one point away: the 1 px edge.
+    fn outlined_file_name(shapes: &[egui::epaint::ClippedShape], name: &str) -> bool {
+        let marks: Vec<_> = shapes
+            .iter()
+            .filter_map(|cs| {
+                let egui::epaint::Shape::Text(t) = &cs.shape else { return None };
+                t.galley.job.text.contains(name).then_some((t.pos, t.override_text_color))
+            })
+            .collect();
+        let white: Vec<_> = marks.iter().filter(|(_, c)| *c == Some(Color32::WHITE)).map(|(p, _)| *p).collect();
+        let black: Vec<_> = marks.iter().filter(|(_, c)| *c == Some(Color32::BLACK)).map(|(p, _)| *p).collect();
+        white.iter().any(|w| {
+            black.iter().any(|b| {
+                let (dx, dy) = ((b.x - w.x).abs(), (b.y - w.y).abs());
+                ((dx - 1.0).abs() < 0.05 && dy < 0.05) || ((dy - 1.0).abs() < 0.05 && dx < 0.05)
+            })
+        })
+    }
 }
 
 fn layer_menu(app: &mut App, ui: &mut egui::Ui) {

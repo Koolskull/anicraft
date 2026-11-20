@@ -7,11 +7,11 @@
 //! the import is the `file.drop` command, one undo step.
 //!
 //! Where a drop lands needs the pointer. Browsers report it while dragging (our own `dragover`
-//! listener, `web::drag_pos`), but winit 0.30 gives no position with dragged files, and Windows
-//! and macOS send no pointer moves during a drag. So a drop waits a moment for the pointer's
-//! first move after it (the system sends one as the drag ends); without one it lands at the
-//! centre of the view, and says so. (winit 0.30.13, which eframe 0.36 and 0.37 both use, still
-//! has no drag position; ADR 0065.)
+//! listener, `web::drag_pos`). winit 0.30 gives no position with dragged files, and a desktop
+//! drag sends no pointer moves. On macOS the cursor is read from AppKit while the files hover,
+//! so the highlight follows the cell under it (ADR 0120). Everywhere else a drop still waits a
+//! moment for the pointer's first move after it; without one it lands at the centre of the view,
+//! and says so. (winit 0.30.13, which eframe 0.36 and 0.37 both use, still has no drag position.)
 
 use crate::app::App;
 use crate::theme::{T, Type, color, font};
@@ -240,8 +240,19 @@ fn drag_pointer(app: &App, ctx: &egui::Context) -> Option<Pos2> {
     }
     #[cfg(not(target_arch = "wasm32"))]
     {
-        if app.drop.tracked { ctx.input(|i| i.pointer.latest_pos()) } else { None }
+        // AppKit knows the cursor during a Finder drag. A pointer move is the fallback, and
+        // only after one has arrived: `latest_pos` from before the drag is a different place.
+        native_drag_cursor(ctx).or_else(|| if app.drop.tracked { ctx.input(|i| i.pointer.latest_pos()) } else { None })
     }
+}
+
+/// The cursor in egui points, from AppKit (ADR 0120). `None` when it cannot be read.
+#[cfg(not(target_arch = "wasm32"))]
+fn native_drag_cursor(ctx: &egui::Context) -> Option<Pos2> {
+    let (x, y) = crate::platform::drag_cursor()?;
+    let z = f64::from(ctx.zoom_factor().max(1e-3));
+    let p = egui::pos2((x / z) as f32, (y / z) as f32);
+    if p.x.is_finite() && p.y.is_finite() { Some(p) } else { None }
 }
 
 /// After the panels drew: the highlight while files hover, and what was dropped.
@@ -255,6 +266,10 @@ pub fn frame(app: &mut App, ctx: &egui::Context) {
         app.drop.tracked |= moved;
         let p = drag_pointer(app, ctx);
         highlight(app, ctx, &hovered, p);
+        // `HoveredFile` does not repeat as the mouse moves, so the highlight is asked to follow.
+        if p.is_some() {
+            ctx.request_repaint();
+        }
     } else if let Some((files, at)) = app.drop.preview.clone() {
         let p = preview_point(app, at);
         highlight(app, ctx, &files, p);
@@ -279,9 +294,9 @@ pub fn frame(app: &mut App, ctx: &egui::Context) {
         }
         #[cfg(not(target_arch = "wasm32"))]
         {
-            if app.drop.tracked {
-                let spot = spot_at(app, ctx.input(|i| i.pointer.latest_pos()));
-                run(app, &files, spot);
+            let p = drag_pointer(app, ctx);
+            if p.is_some() {
+                run(app, &files, spot_at(app, p));
             } else {
                 app.drop.waiting = Some(Waiting { files, since: now });
                 ctx.request_repaint_after(std::time::Duration::from_millis(50));
@@ -300,13 +315,14 @@ pub fn frame(app: &mut App, ctx: &egui::Context) {
 #[cfg(not(target_arch = "wasm32"))]
 fn resolve_waiting(app: &mut App, ctx: &egui::Context, moved: bool, now: f64) {
     let Some(w) = &app.drop.waiting else { return };
+    let live = native_drag_cursor(ctx);
     let timed_out = now - w.since > WAIT_FOR_POINTER;
-    if !moved && !timed_out {
+    if live.is_none() && !moved && !timed_out {
         ctx.request_repaint_after(std::time::Duration::from_millis(50));
         return;
     }
     let Some(w) = app.drop.waiting.take() else { return };
-    let p = if moved { ctx.input(|i| i.pointer.latest_pos()) } else { None };
+    let p = live.or_else(|| if moved { ctx.input(|i| i.pointer.latest_pos()) } else { None });
     run(app, &w.files, spot_at(app, p));
 }
 
@@ -442,14 +458,15 @@ fn view_centre(app: &App) -> (f32, f32) {
 }
 
 /// Why a layer can't take a drop (the engine refuses the same), in the interface language.
-fn layer_refusal(app: &App, layer: LayerId) -> Option<String> {
+/// A sound is the exception on a pixel layer: it goes on the keyframe, not into the pixels (ADR 0120).
+fn layer_refusal(app: &App, layer: LayerId, sounds_only: bool) -> Option<String> {
     let tl = app.s.timeline();
     let l = tl.layer(layer)?;
     match l.kind {
         LayerKind::Folder => Some(tr!("{layer} is a folder: drop on one of its layers", layer = l.name)),
         LayerKind::Camera => Some(tr!("{layer} is the camera layer: drop on a layer below it", layer = l.name)),
         LayerKind::Armature => Some(tr!("{layer} holds an armature: drop on another layer", layer = l.name)),
-        LayerKind::Raster => Some(tr!("{layer} is a pixel layer: paint it with the Raster tool", layer = l.name)),
+        LayerKind::Raster if !sounds_only => Some(tr!("{layer} is a pixel layer: paint it with the Raster tool", layer = l.name)),
         _ if l.locked || tl.locked_by_folder(layer) => Some(tr!("{layer} is locked: unlock it to drop onto it", layer = l.name)),
         _ => None,
     }
@@ -538,7 +555,7 @@ fn highlight(app: &App, ctx: &egui::Context, files: &[PathBuf], p: Option<Pos2>)
             }
             let name = app.s.timeline().layer(layer).map(|l| l.name.clone()).unwrap_or_default();
             let sounds_only = !known.is_empty() && known.iter().all(|f| kind_of(f) == DropKind::Sound);
-            let (ok, text) = match layer_refusal(app, layer) {
+            let (ok, text) = match layer_refusal(app, layer, sounds_only) {
                 Some(why) => (false, why),
                 None if !fits(DropTarget::Timeline) => (false, refusal(DropKind::Unsupported, false)),
                 None if sounds_only => (true, tr!("Put {what} on {layer}'s keyframe at frame {frame}", what = what, layer = name, frame = frame + 1)),

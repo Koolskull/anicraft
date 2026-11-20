@@ -10,7 +10,7 @@ repository.workspace = true
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2 = { version = "0.6.5", features = ["exception"] }
 block2 = "0.6"
-objc2-app-kit = { version = "0.3.2", default-features = false, features = ["std", "NSApplication", "NSEvent", "NSResponder", "block2", "objc2-core-graphics"] }
+objc2-app-kit = { version = "0.3.2", default-features = false, features = ["std", "NSApplication", "NSEvent", "NSResponder", "NSView", "NSWindow", "block2", "objc2-core-graphics"] }
 objc2-core-graphics = { version = "0.3.2", default-features = false, features = ["std", "CGEvent", "CGEventTypes"] }
 
 # Not the workspace lints: those forbid unsafe, and this crate is the one AppKit monitor

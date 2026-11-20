@@ -10,6 +10,7 @@ pub mod clip;
 pub mod edit;
 pub mod envelope;
 pub mod morph;
+pub mod outline;
 pub mod planar;
 pub mod pressure;
 pub mod raw;

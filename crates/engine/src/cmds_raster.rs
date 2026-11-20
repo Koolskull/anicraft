@@ -138,6 +138,8 @@ pub(crate) struct RasterCover {
     width: u32,
     height: u32,
     bytes: Vec<u8>,
+    /// Picture dabs already stamped this gesture. The next move continues the turn (ADR 0119).
+    dabs: u32,
 }
 
 /// The plate rows from before this drag, for `y0..y1`. `None` outside a gesture, where the
@@ -182,11 +184,13 @@ fn lay(s: &mut Session, width: u32, height: u32, samples: &[Sample], pass: Pass,
         let Some(cover) = s.raster_cover.as_mut() else {
             return Err(EngineError::State("this stage is too large for a stroke".into()));
         };
-        lay_into(&mut cover.bytes, width, height, samples, pass, continued, 0.0);
+        let start = cover.dabs as usize;
+        let n = lay_into(&mut cover.bytes, width, height, samples, pass, continued, 0.0, start);
+        cover.dabs = cover.dabs.saturating_add(u32::try_from(n).unwrap_or(u32::MAX));
         return Ok(band_of(&cover.bytes, width, y0, y1));
     }
     let mut local = vec![0u8; band_n];
-    lay_into(&mut local, width, band_h, samples, pass, continued, y0 as f32);
+    lay_into(&mut local, width, band_h, samples, pass, continued, y0 as f32, 0);
     Ok(local)
 }
 
@@ -201,11 +205,11 @@ fn ensure_cover(s: &mut Session, width: u32, height: u32) -> Result<()> {
         return Err(EngineError::State("this stage is too large for a stroke".into()));
     }
     bytes.resize(n, 0);
-    s.raster_cover = Some(RasterCover { width, height, bytes });
+    s.raster_cover = Some(RasterCover { width, height, bytes, dabs: 0 });
     Ok(())
 }
 
-fn lay_into(mask: &mut [u8], width: u32, height: u32, samples: &[Sample], pass: Pass, continued: bool, shift: f32) {
+fn lay_into(mask: &mut [u8], width: u32, height: u32, samples: &[Sample], pass: Pass, continued: bool, shift: f32, dab0: usize) -> usize {
     let stroke = pass.stroke;
     let spaced = sample_stroke(samples, |mid| {
         let width = diameter(stroke, mid);
@@ -220,9 +224,12 @@ fn lay_into(mask: &mut [u8], width: u32, height: u32, samples: &[Sample], pass: 
         let opacity = dab_opacity(stroke, sample.pressure);
         let tip = Tip { radius: diameter(stroke, sample.pressure) * 0.5, softness: stroke.softness, antialias: stroke.antialias, color: stroke.color, opacity, erase: false };
         let (aim_x, aim_y) = stroke_aim(&spaced, i + origin);
-        let turn = if pass.picture == Picture::None { 0.0 } else { dab_turn(sample.x, sample.y - shift, i) };
+        // `dab0` is how many picture dabs this gesture already laid, so a new move does not
+        // spin the first stamp again (ADR 0119).
+        let turn = if pass.picture == Picture::None { 0.0 } else { dab_turn(sample.x, sample.y - shift, dab0 + i) };
         let _ = stamp_mark(mask, width, height, sample.x, sample.y - shift, tip, Stamp { flow: stroke.flow, grain: pass.grain, aim_x, aim_y, picture: pass.picture, turn });
     }
+    dabs.len()
 }
 
 fn band_of(mask: &[u8], width: u32, y0: u32, y1: u32) -> Vec<u8> {
@@ -378,6 +385,8 @@ mod tests {
         s.execute("paint.raster", &json!({"samples": [{"x": 40.0, "y": 20.0, "pressure": 1.0}, {"x": 48.0, "y": 20.0, "pressure": 1.0}], "continued": true, "size": 4.0, "size_min": 4.0, "softness": 0.0, "antialias": 0.0, "color": "#0000ff"})).expect("move");
         let id_again = s.active_layer().and_then(|l| l.keyframe_at(5)).and_then(|k| k.plate.as_ref()).expect("painted").buffer_id();
         assert_eq!(id, id_again, "a continued stroke copies the plate once");
+        let dabs = s.raster_cover.as_ref().map(|c| c.dabs).unwrap_or(0);
+        assert!(dabs >= 2, "picture turns keep counting across the move, got {dabs}");
         s.end_gesture();
         assert_eq!(s.history_len(), steps + 1);
         let kept = s.active_layer().and_then(|l| l.keyframe_at(0)).and_then(|k| k.plate.as_ref()).expect("f6").image();

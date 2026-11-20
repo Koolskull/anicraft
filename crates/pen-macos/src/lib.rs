@@ -12,7 +12,10 @@
 
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
+use std::collections::VecDeque;
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use std::sync::PoisonError;
 
 /// How long a tablet point still belongs to the mouse event the system sends with it.
 pub const PEN_WINDOW_SECS: f64 = 0.03;
@@ -191,6 +194,50 @@ fn is_mouse(kind: u64) -> bool {
 
 mod hid;
 
+/// One drag point, in window points with the origin at the top left.
+/// `pressure` is the pen's force when this event carried one.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct StrokePoint {
+    pub x: f64,
+    pub y: f64,
+    pub pressure: Option<f32>,
+}
+
+/// How many drag points to keep. Older ones fall off so a stuck monitor cannot grow.
+const POINT_CAP: usize = 2048;
+
+static POINTS: Mutex<VecDeque<StrokePoint>> = Mutex::new(VecDeque::new());
+
+/// Remember one drag point. Not finite values are ignored. The raster tool drains these.
+pub fn push_point(x: f64, y: f64, pressure: Option<f32>) {
+    if !x.is_finite() || !y.is_finite() {
+        return;
+    }
+    let pressure = pressure.filter(|p| p.is_finite()).map(|p| p.clamp(0.0, 1.0));
+    let mut q = POINTS.lock().unwrap_or_else(PoisonError::into_inner);
+    if q.len() >= POINT_CAP {
+        q.pop_front();
+    }
+    q.push_back(StrokePoint { x, y, pressure });
+}
+
+/// Take every point recorded since the last drain, oldest first.
+pub fn drain_points() -> Vec<StrokePoint> {
+    let mut q = POINTS.lock().unwrap_or_else(PoisonError::into_inner);
+    q.drain(..).collect()
+}
+
+/// A content-view point with its origin at the top left (ADR 0120). `local_x` and `local_y`
+/// are already in the view's own coordinates, measured from the view's origin. An unflipped
+/// view grows upward, so its y is turned over. `None` when the point is outside the view.
+pub fn content_point(local_x: f64, local_y: f64, width: f64, height: f64, flipped: bool) -> Option<(f64, f64)> {
+    if !(local_x.is_finite() && local_y.is_finite() && width.is_finite() && height.is_finite() && width > 0.0 && height > 0.0) {
+        return None;
+    }
+    let y = if flipped { local_y } else { height - local_y };
+    if local_x >= 0.0 && y >= 0.0 && local_x <= width && y <= height { Some((local_x, y)) } else { None }
+}
+
 /// Start listening. Safe to call more than once. No-op off the main thread and off macOS.
 pub fn install() {
     #[cfg(target_os = "macos")]
@@ -212,11 +259,25 @@ pub fn current() -> Option<f32> {
     }
 }
 
+/// The cursor, in the content view that contains it (ADR 0120). View points, origin top left.
+/// `None` off macOS, off the main thread, or when the cursor is inside no window. A file drag
+/// does not deliver pointer moves, so the shell asks here instead of waiting on winit.
+pub fn cursor_in_content() -> Option<(f64, f64)> {
+    #[cfg(target_os = "macos")]
+    {
+        imp::cursor_in_content()
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        None
+    }
+}
+
 #[cfg(target_os = "macos")]
 mod imp {
-    use super::{accept_sample, live, prefer_pressure, remember};
+    use super::{accept_sample, content_point, live, prefer_pressure, remember};
     use objc2::MainThreadMarker;
-    use objc2_app_kit::{NSEvent, NSEventButtonMask, NSEventMask, NSEventType};
+    use objc2_app_kit::{NSApplication, NSEvent, NSEventButtonMask, NSEventMask, NSEventType};
     use objc2_core_graphics::{CGEvent, CGEventField};
     use std::ptr::NonNull;
     use std::sync::atomic::{AtomicBool, Ordering};
@@ -254,6 +315,27 @@ mod imp {
         let token = unsafe { NSEvent::addLocalMonitorForEventsMatchingMask_handler(mask, &block) };
         std::mem::forget(block);
         std::mem::forget(token);
+    }
+
+    /// Frontmost window whose content view contains the cursor. A drag from Finder does not
+    /// make the window key, and it does not send pointer moves, so this is read on purpose.
+    pub fn cursor_in_content() -> Option<(f64, f64)> {
+        let mtm = MainThreadMarker::new()?;
+        let caught = objc2::exception::catch(std::panic::AssertUnwindSafe(|| {
+            let app = NSApplication::sharedApplication(mtm);
+            // `windows` is front to back. The first view that contains the cursor wins.
+            for window in app.windows().to_vec() {
+                let Some(view) = window.contentView() else { continue };
+                let base = window.mouseLocationOutsideOfEventStream();
+                let local = view.convertPoint_fromView(base, None);
+                let bounds = view.bounds();
+                if let Some(p) = content_point(local.x - bounds.origin.x, local.y - bounds.origin.y, bounds.size.width, bounds.size.height, view.isFlipped()) {
+                    return Some(p);
+                }
+            }
+            None
+        }));
+        caught.ok().flatten()
     }
 
     pub fn current() -> Option<f32> {
@@ -304,7 +386,65 @@ mod imp {
                     remember(p, now);
                 }
             }
+            // Left drag and tablet points only. A right-click or a scroll is not a stroke.
+            if matches!(kind, 1 | 6 | 23) {
+                record_points(event, sample);
+            }
         }));
+    }
+
+    /// Window points for this event and any AppKit coalesced into it (ADR 0119).
+    fn record_points(event: &NSEvent, pressure: Option<f32>) {
+        let Some(mtm) = MainThreadMarker::new() else { return };
+        let Some(window) = event.window(mtm) else { return };
+        let height = window.frame().size.height;
+        if !(height.is_finite() && height > 0.0) {
+            return;
+        }
+        let mut wrote = false;
+        for ev in coalesced(event) {
+            let loc = ev.locationInWindow();
+            if !loc.x.is_finite() || !loc.y.is_finite() {
+                continue;
+            }
+            let own = ev.pressure();
+            let p = if own.is_finite() && own > 0.02 && own < 0.98 { Some(own.clamp(0.0, 1.0)) } else { pressure.filter(|n| n.is_finite()) };
+            super::push_point(loc.x, height - loc.y, p);
+            wrote = true;
+        }
+        if !wrote {
+            let loc = event.locationInWindow();
+            if loc.x.is_finite() && loc.y.is_finite() {
+                super::push_point(loc.x, height - loc.y, pressure.filter(|n| n.is_finite()));
+            }
+        }
+    }
+
+    /// The event itself, or each event AppKit folded into it. A missing selector is just this one.
+    fn coalesced(event: &NSEvent) -> Vec<&NSEvent> {
+        let sel = objc2::sel!(coalescedEvents);
+        let answers: objc2::runtime::Bool = unsafe { objc2::msg_send![event, respondsToSelector: sel] };
+        if !answers.as_bool() {
+            return vec![event];
+        }
+        let arr: *mut objc2::runtime::AnyObject = unsafe { objc2::msg_send![event, coalescedEvents] };
+        if arr.is_null() {
+            return vec![event];
+        }
+        let count: usize = unsafe { objc2::msg_send![arr, count] };
+        if count == 0 {
+            return vec![event];
+        }
+        let mut out = Vec::with_capacity(count.min(64));
+        for i in 0..count.min(64) {
+            let item: *mut objc2::runtime::AnyObject = unsafe { objc2::msg_send![arr, objectAtIndex: i] };
+            if item.is_null() {
+                continue;
+            }
+            // The array keeps the event for this call.
+            out.push(unsafe { &*item.cast::<NSEvent>() });
+        }
+        if out.is_empty() { vec![event] } else { out }
     }
 
     /// CoreGraphics tablet pressure, when the mouse event's own pressure is 0 or 1.
@@ -325,6 +465,40 @@ mod imp {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_content_point_is_top_left_and_stays_inside_the_view() {
+        assert_eq!(content_point(10.0, 4.0, 100.0, 50.0, true), Some((10.0, 4.0)));
+        // Unflipped: y grows up, so 4 from the bottom is 46 from the top.
+        assert_eq!(content_point(10.0, 4.0, 100.0, 50.0, false), Some((10.0, 46.0)));
+        assert_eq!(content_point(0.0, 50.0, 100.0, 50.0, false), Some((0.0, 0.0)), "the top of an unflipped view");
+        assert_eq!(content_point(0.0, 0.0, 100.0, 50.0, false), Some((0.0, 50.0)), "the bottom edge still belongs");
+        assert_eq!(content_point(100.0, 0.0, 100.0, 50.0, true), Some((100.0, 0.0)), "the far edge still belongs");
+        assert!(content_point(-1.0, 4.0, 100.0, 50.0, true).is_none());
+        assert!(content_point(10.0, 60.0, 100.0, 50.0, true).is_none());
+        assert!(content_point(f64::NAN, 0.0, 100.0, 50.0, true).is_none());
+        assert!(content_point(0.0, 0.0, 0.0, 50.0, true).is_none());
+    }
+
+    #[test]
+    fn a_stroke_log_keeps_order_and_drops_the_oldest() {
+        let _ = drain_points();
+        push_point(1.0, 2.0, Some(0.25));
+        push_point(3.0, 4.0, None);
+        push_point(f64::NAN, 0.0, Some(1.0));
+        let pts = drain_points();
+        assert_eq!(pts.len(), 2);
+        assert_eq!(pts[0], StrokePoint { x: 1.0, y: 2.0, pressure: Some(0.25) });
+        assert_eq!(pts[1].pressure, None);
+        assert!(drain_points().is_empty());
+        for i in 0..POINT_CAP + 5 {
+            push_point(i as f64, 0.0, None);
+        }
+        let pts = drain_points();
+        assert_eq!(pts.len(), POINT_CAP);
+        assert_eq!(pts[0].x, 5.0, "the oldest past the cap are gone");
+        assert_eq!(pts[pts.len() - 1].x, (POINT_CAP + 4) as f64);
+    }
 
     #[test]
     fn a_pen_is_a_tablet_point_and_a_mouse_is_not() {

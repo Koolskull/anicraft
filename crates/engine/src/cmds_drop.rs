@@ -3,8 +3,8 @@
 //! images and sounds dropped on the stage go onto the active layer at the playhead at the drop
 //! point, and dropped on the Library go into the Library (into the folder under the pointer;
 //! an SVG as a graphic symbol, ADR 0065). Dropped on a layer's frame in the timeline, a sound
-//! goes onto the keyframe there and a drawing or image onto that layer at that frame, in a
-//! keyframe made there if there is none (ADR 0065).
+//! goes onto the keyframe there (a pixel layer included, ADR 0120) and a drawing or image onto
+//! that layer at that frame, in a keyframe made there if there is none (ADR 0065).
 //! The routing is a pure function the shell and tests share; `file.drop` does the import, so a
 //! drop of several files is one undo step however many it brings in.
 
@@ -220,11 +220,14 @@ fn onto_timeline(s: &mut Session, p: &Value, files: &[PathBuf], x: f32, y: f32) 
     }
     let tl = s.timeline();
     let l = tl.layer(layer).ok_or_else(|| EngineError::State(format!("no layer with id {} here", layer.0)))?;
+    // A sound does not paint the plate. It joins the library and the keyframe, including on the
+    // pixel layer the picture is drawn on (ADR 0120). A drawing or an image on that layer stays refused.
+    let sounds_only = files.iter().all(|f| kind_of(f) == DropKind::Sound);
     let refuse = match l.kind {
         anicraft_doc::LayerKind::Folder => Some("is a folder: drop on one of its layers"),
         anicraft_doc::LayerKind::Camera => Some("is the camera layer: drop on a layer below it"),
         anicraft_doc::LayerKind::Armature => Some("holds an armature, posed by its bones: drop on another layer"),
-        anicraft_doc::LayerKind::Raster => Some("is a pixel layer: paint it with the Raster tool"),
+        anicraft_doc::LayerKind::Raster if !sounds_only => Some("is a pixel layer: paint it with the Raster tool"),
         _ if l.locked || tl.locked_by_folder(layer) => Some("is locked: unlock it to drop onto it"),
         _ => None,
     };
@@ -236,10 +239,12 @@ fn onto_timeline(s: &mut Session, p: &Value, files: &[PathBuf], x: f32, y: f32) 
     }
     s.layer = layer;
     s.frame = frame;
-    // Artwork goes into a keyframe starting at the frame: made there when the frame is inside
-    // another's span (keeping what it showed, as Insert Keyframe does).
+    // A keyframe starts at the cell when one does not already. Artwork keeps what the frame
+    // showed, and a sound starts there too, so the clip is the cell that was hit (ADR 0120).
+    // A drop on a keyframe's first cell does not split. `sound.place` itself is unchanged.
     let artwork = files.iter().any(|f| kind_of(f) != DropKind::Sound);
-    let made = artwork && s.timeline().layer(layer).is_some_and(|l| l.keyframe_starting_at(frame).is_none());
+    let sound = files.iter().any(|f| kind_of(f) == DropKind::Sound);
+    let made = (artwork || sound) && s.timeline().layer(layer).is_some_and(|l| l.keyframe_starting_at(frame).is_none());
     if made {
         crate::cmds_timeline::insert_keyframe_at(s.layer_mut(Some(layer))?, frame, true)?;
     }
@@ -264,8 +269,8 @@ fn onto_timeline(s: &mut Session, p: &Value, files: &[PathBuf], x: f32, y: f32) 
                 let v = crate::cmds_sound::import_to_library(s, &json!({"path": path}))?;
                 let snd = v["sound"].as_u64().ok_or_else(nothing)?;
                 items.push(json!({"sound": snd}));
-                // Onto the keyframe the frame is in (one is made past the layer's end), as long
-                // as the sound when it is the layer's last.
+                // Onto the keyframe that starts at this cell (made above when it did not), as
+                // long as the sound when that keyframe is the layer's last.
                 crate::cmds_sound::place(s, &json!({"sound": snd, "layer": layer.0, "frame": frame, "extend": true}))?;
             }
             _ => {

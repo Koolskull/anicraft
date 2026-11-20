@@ -41,6 +41,27 @@ fn tool_icon(tool: Tool) -> Icon {
     }
 }
 
+/// The sizes the Properties panel's W and H take, in stage pixels.
+const SIZE_RANGE: std::ops::RangeInclusive<f32> = 0.1..=100_000.0;
+
+/// The stage-space affine `[a, b, c, d, e, f]` that makes the box `[x0, y0, x1, y1]` `w` wide and
+/// `h` high with its top-left corner where it is (#294). A side with no extent (a level line's
+/// height) can't be stretched and stays as it is; `None` when nothing would change or a size
+/// isn't a positive number.
+pub fn resize_affine(b: [f32; 4], w: f32, h: f32) -> Option<[f32; 6]> {
+    let [x0, y0, x1, y1] = b;
+    let (w0, h0) = (x1 - x0, y1 - y0);
+    if !(w.is_finite() && h.is_finite() && w > 0.0 && h > 0.0 && w0.is_finite() && h0.is_finite()) {
+        return None;
+    }
+    let kx = if w0 > 1e-3 { w / w0 } else { 1.0 };
+    let ky = if h0 > 1e-3 { h / h0 } else { 1.0 };
+    if (kx - 1.0).abs() < 1e-6 && (ky - 1.0).abs() < 1e-6 {
+        return None;
+    }
+    Some([kx, 0.0, 0.0, ky, x0 * (1.0 - kx), y0 * (1.0 - ky)])
+}
+
 /// How the tools are laid out where they are (ADR 0087).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ToolFlow {
@@ -100,6 +121,10 @@ fn tool_items(app: &mut App, ui: &mut egui::Ui, area: Rect, flow: ToolFlow) {
         a11y::control(ui, &resp, WidgetType::Button, &name, Some(active));
         if active {
             a11y::anchor(ui, a11y::Region::Tools, area, &resp);
+        }
+        // F1 over (or on) a tool's button: that tool's section of the guide (ADR 0096).
+        if resp.hovered() || resp.has_focus() {
+            crate::context_help::offer(app, ui.ctx(), crate::context_help::Subject::Tool(tool));
         }
         let resp = resp.on_hover_text(format!("{name}
 {}", crate::i18n::t(tool.hint())));
@@ -175,7 +200,7 @@ fn tool_swatches(app: &mut App, ui: &mut egui::Ui) {
     for (fill, resp) in [(true, fill_resp), (false, stroke_resp)] {
         let name = if fill { tr!("Fill colour") } else { tr!("Stroke colour") };
         a11y::control(ui, &resp, WidgetType::ColorButton, name, None);
-        let resp = resp.on_hover_text(if fill { tr!("Fill colour: click to pick the colour shapes are filled with") } else { tr!("Stroke colour: click to pick the colour of lines and outlines") });
+        let resp = resp.on_hover_text(if fill { tr!("Fill colour: click to pick the colour and how clear it is. Each stop of a gradient has its own.") } else { tr!("Stroke colour: click to pick the colour and how clear it is") });
         // As in Animate, the square clicked last is the one swatches set (ADR 0078).
         if resp.clicked() {
             app.colour_target = if fill { crate::swatches_panel::ColourTarget::Fill } else { crate::swatches_panel::ColourTarget::Stroke };
@@ -261,35 +286,88 @@ pub fn edit_bar(app: &mut App, ui: &mut egui::Ui) {
     ui.horizontal_centered(|ui| {
         // The scene being edited; the menu switches scenes and manages them.
         let name = app.s.doc.scenes.get(app.s.scene).map_or_else(|| tr!("Scene").to_string(), |s| s.name.clone());
-        egui::ComboBox::from_id_salt("scene").selected_text(text(Type::Body, name).strong()).height(480.0).show_ui(ui, |ui| {
-            ui.set_min_width(240.0);
-            let scenes: Vec<(String, u32)> = app.s.doc.scenes.iter().map(|s| (s.name.clone(), s.timeline.frame_count())).collect();
-            for (i, (n, frames)) in scenes.iter().enumerate() {
-                let r = ui.horizontal(|ui| {
-                    let r = ui.selectable_label(i == app.s.scene, n.as_str());
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        ui.label(text(Type::DataSmall, format!("{frames} f")).color(T.text_faint));
-                    });
-                    r
+        ui.horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = 1.0;
+            let inside_symbol = !app.s.editing.is_empty();
+
+            if inside_symbol {
+                let label_response = ui.add(
+                    egui::Button::new(text(Type::Body, name.clone()).strong())
+                        .corner_radius(egui::CornerRadius { nw: T.radius_control, ne: 0, sw: T.radius_control, se: 0 }),
+                );
+
+                #[cfg(test)]
+                ui.ctx().data_mut(|data| {
+                    data.insert_temp(
+                        egui::Id::new("test_scene_label_rect"),
+                        label_response.interact_rect,
+                    );
                 });
-                if r.inner.clicked() && i != app.s.scene {
-                    app.playing = false;
-                    app.frame_sel = None;
-                    app.run("scene.select", serde_json::json!({"scene": i}));
-                } else if r.inner.clicked() && !app.s.editing.is_empty() {
-                    // The scene itself, from inside a symbol: back to it (ADR 0045).
+
+                if label_response.clicked() {
                     app.playing = false;
                     app.frame_sel = None;
                     app.run("symbol.exit", serde_json::json!({"all": true}));
                 }
             }
-            ui.separator();
-            for id in ["scene.new", "scene.duplicate", "scene.rename", "scene.delete", "scene.move_up", "scene.move_down"] {
-                crate::menus::cmd_item(app, ui, id);
+
+            if inside_symbol {
+                let corners = egui::CornerRadius { nw: 0, ne: T.radius_control, sw: 0, se: T.radius_control };
+
+                let widgets = &mut ui.style_mut().visuals.widgets;
+                widgets.inactive.corner_radius = corners;
+                widgets.hovered.corner_radius = corners;
+                widgets.active.corner_radius = corners;
+                widgets.open.corner_radius = corners;
             }
-        })
-        .response
-        .set_name(tr!("Scene"));
+
+            let scene_caption = if inside_symbol { String::new() } else { name };
+
+            let scene_response = egui::ComboBox::from_id_salt("scene")
+                .width(if inside_symbol { 32.0 } else { ui.spacing().combo_width })
+                .selected_text(text(Type::Body, scene_caption).strong())
+                .height(480.0)
+                .show_ui(ui, |ui| {
+                ui.set_min_width(240.0);
+                let scenes: Vec<(String, u32)> = app.s.doc.scenes.iter().map(|s| (s.name.clone(), s.timeline.frame_count())).collect();
+                for (i, (n, frames)) in scenes.iter().enumerate() {
+                    let r = ui.add(
+                        egui::Button::selectable(i == app.s.scene, n.as_str())
+                            .right_text(text(Type::DataSmall, format!("{frames} f")).color(T.text_faint))
+                            .min_size(egui::vec2(ui.available_width(), ui.spacing().interact_size.y)),
+                    );
+                    if r.clicked() && i != app.s.scene {
+                        app.playing = false;
+                        app.frame_sel = None;
+                        app.run("scene.select", serde_json::json!({"scene": i}));
+                    } else if r.clicked() && !app.s.editing.is_empty() {
+                        // The scene itself, from inside a symbol: back to it (ADR 0045).
+                        app.playing = false;
+                        app.frame_sel = None;
+                        app.run("symbol.exit", serde_json::json!({"all": true}));
+                    }
+                }
+                ui.separator();
+                for id in ["scene.new", "scene.duplicate", "scene.rename", "scene.delete", "scene.move_up", "scene.move_down"] {
+                    crate::menus::cmd_item(app, ui, id);
+                }
+            })
+            .response;
+
+            #[cfg(test)]
+            ui.ctx().data_mut(|data| {
+                data.insert_temp(
+                    egui::Id::new("test_scene_arrow_rect"),
+                    scene_response.interact_rect,
+                );
+                data.insert_temp(
+                    egui::Id::new("test_scene_arrow_id"),
+                    scene_response.id,
+                );
+            });
+
+            scene_response.set_name(tr!("Scene"));
+        });
         // The symbols open for editing (ADR 0045), as in Animate's edit bar: a click on one
         // goes back to it; the last is the one being edited.
         // A group (ADR 0073) shows as "Group" and a drawing object (ADR 0080) as "Drawing
@@ -323,18 +401,50 @@ pub fn edit_bar(app: &mut App, ui: &mut egui::Ui) {
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             let z = app.view.zoom;
             let canvas = app.stage_cache.canvas;
-            egui::ComboBox::from_id_salt("zoom").width(84.0).selected_text(text(Type::Data, format!("{:>4.0}%", z * 100.0))).show_ui(ui, |ui| {
+            // The presets arrow alone opens the menu, as in Animate: clicking the text never does.
+            // The arrow is an icon drawn over a blank button (the fonts may lack an arrow glyph).
+            let arrow = ui.menu_button("   ", |ui| {
                 if ui.selectable_label(false, tr!("Fit in window")).clicked() {
+                    ui.close();
                     app.view.fit = true;
                 }
                 for pct in [25.0f32, 50.0, 100.0, 200.0, 400.0, 800.0] {
                     if ui.selectable_label((z * 100.0 - pct).abs() < 0.5, text(Type::Data, format!("{pct:>4.0}%"))).clicked() {
+                        ui.close();
                         app.zoom_about(canvas, canvas.center(), pct / 100.0);
                     }
                 }
-            })
-            .response
-            .set_name(tr!("Zoom"));
+            });
+            crate::icons::paint(ui.painter(), Rect::from_center_size(arrow.response.rect.center(), vec2(12.0, 12.0)), Icon::ChevronDown, if arrow.response.hovered() { T.icon_hot } else { T.icon });
+            arrow.response.set_name(tr!("Zoom presets"));
+            ui.ctx().data_mut(|d| d.insert_temp(egui::Id::new("zoom_arrow"), arrow.response.rect));
+            // The percentage itself is typed here: focus to type a value, Enter or focus loss applies it.
+            let was_editing = app.zoom_text.is_some();
+            let mut value = app.zoom_text.take().unwrap_or_else(|| format!("{:>4.0}%", z * 100.0));
+            let field = with_type(ui, Type::Data, |ui| ui.add(egui::TextEdit::singleline(&mut value).desired_width(56.0).char_limit(7)).named(tr!("Zoom")));
+            ui.ctx().data_mut(|d| d.insert_temp(egui::Id::new("zoom_field"), field.rect));
+            if !was_editing && field.gained_focus() {
+                // Type digits over digits, not over the percent sign.
+                value = format!("{:.0}", z * 100.0);
+            }
+            let enter = ui.input(|i| i.key_pressed(egui::Key::Enter));
+            if field.lost_focus() || (enter && field.has_focus()) {
+                let typed = value.trim();
+                let typed = typed.strip_suffix('%').unwrap_or(typed).trim();
+                if let Ok(pct) = typed.parse::<f32>()
+                    && pct.is_finite()
+                {
+                    app.zoom_about(canvas, canvas.center(), pct.clamp(5.0, 6400.0) / 100.0);
+                }
+                app.zoom_text = None;
+                if enter {
+                    ui.memory_mut(|m| m.surrender_focus(field.id));
+                }
+            } else if field.has_focus() {
+                app.zoom_text = Some(value);
+            } else {
+                app.zoom_text = None;
+            }
             // Beside the zoom, as in Animate (#251): a toggle, on = the pasteboard is hidden.
             let clip = app.view.clip_to_stage;
             if crate::timeline::icon_button(ui, tr!("Clip content outside the stage"), Some(clip), Icon::ClipStage).clicked() {
@@ -360,6 +470,13 @@ pub fn status_bar(app: &mut App, ui: &mut egui::Ui) {
             let small = |t: String| text(Type::Data, t).color(T.text_faint);
             ui.label(small(tr!("undo {steps} · {size} MB", steps = app.s.history().undo_len(), size = format!("{:.1}", app.s.history().bytes() as f32 / (1024.0 * 1024.0)))));
             ui.add_space(12.0);
+            // An assistant can edit this window (ADR 0104): always in view while that is so.
+            #[cfg(not(target_arch = "wasm32"))]
+            if let Some(port) = crate::remote::port(app) {
+                ui.label(text(Type::Label, tr!("Remote control on (port {port})", port = port)).color(T.text_faint))
+                    .on_hover_text(tr!("An assistant can edit this document through a control port on this computer. Its edits appear here at once and undo like your own. Started with --control; close AniCraft to turn it off."));
+                ui.add_space(12.0);
+            }
             if let Some(a) = crate::autosave::status(app, now) {
                 ui.label(small(a)).on_hover_text(tr!("A recovery copy of your unsaved work. If AniCraft closes unexpectedly, the next start offers it back."));
                 ui.add_space(12.0);
@@ -585,29 +702,77 @@ pub(crate) fn align_panel(app: &mut App, ui: &mut egui::Ui) {
 }
 
 /// Undo history: past steps (click to go back), the current state, and redoable steps (dimmed).
+/// Ctrl+click picks steps (Shift+click a range) for Save As Command, which keeps them as a
+/// saved command in the Commands menu (ADR 0097); so does each step's context menu.
 pub(crate) fn history(app: &mut App, ui: &mut egui::Ui) {
+    let picked: std::collections::BTreeSet<usize> = crate::macros_ui::picked(app).into_iter().collect();
     let hist = app.s.history();
     let past: Vec<String> = hist.undo_labels().map(str::to_string).collect();
     let future: Vec<String> = hist.redo_labels().map(str::to_string).collect();
     let evicted = hist.evicted;
     let mut target = None;
-    egui::ScrollArea::vertical().id_salt("history").max_height(ui.available_height().max(60.0)).auto_shrink([false, false]).stick_to_bottom(true).show(ui, |ui| {
+    // (step, toggle, range)
+    let mut pick: Option<(usize, bool, bool)> = None;
+    let mut save = false;
+    let footer = crate::theme::TARGET + 8.0;
+    let tip = tr!("Click to go back to this step · Ctrl+click picks it for Save As Command, Shift+click a range");
+    egui::ScrollArea::vertical().id_salt("history").max_height((ui.available_height() - footer).max(crate::theme::TARGET)).auto_shrink([false, false]).stick_to_bottom(true).show(ui, |ui| {
         let base = if evicted > 0 { tr!("… older steps freed (memory budget)") } else { tr!("Opened document") };
-        if ui.selectable_label(past.is_empty(), text(Type::Body, base).color(if evicted > 0 { T.text_faint } else { T.text_dim })).clicked() {
+        if ui.selectable_label(past.is_empty() && picked.is_empty(), text(Type::Body, base).color(if evicted > 0 { T.text_faint } else { T.text_dim })).clicked() {
             target = Some(0);
         }
-        for (i, label) in past.iter().enumerate() {
+        let rows = past.iter().map(|l| (l, false)).chain(future.iter().map(|l| (l, true)));
+        for (i, (label, undone)) in rows.enumerate() {
             let current = i + 1 == past.len();
-            if ui.selectable_label(current, crate::i18n::t_dyn(label).into_owned()).clicked() {
-                target = Some(i + 1);
+            let on = picked.contains(&i);
+            let shown = crate::i18n::t_dyn(label).into_owned();
+            // With steps picked, the picks are highlighted and the current step is marked.
+            let shown = if current && !picked.is_empty() { format!("› {shown}") } else { shown };
+            let t = if undone { text(Type::Body, shown).color(T.text_faint).italics() } else { text(Type::Body, shown) };
+            let r = ui.selectable_label(if picked.is_empty() { current } else { on }, t).on_hover_text(tip);
+            if r.clicked() {
+                let m = ui.input(|i| i.modifiers);
+                if m.command || m.shift {
+                    pick = Some((i, m.command, m.shift));
+                } else {
+                    target = Some(i + 1);
+                }
             }
+            r.context_menu(|ui| {
+                if ui.button(if on { tr!("Unpick Step") } else { tr!("Pick for Save As Command") }).clicked() {
+                    pick = Some((i, true, false));
+                    ui.close();
+                }
+                if ui.button(tr!("Save As Command…")).clicked() {
+                    if !on {
+                        pick = Some((i, true, false));
+                    }
+                    save = true;
+                    ui.close();
+                }
+            });
         }
-        for (i, label) in future.iter().enumerate() {
-            if ui.selectable_label(false, text(Type::Body, crate::i18n::t_dyn(label)).color(T.text_faint).italics()).clicked() {
-                target = Some(past.len() + i + 1);
+    });
+    ui.horizontal_wrapped(|ui| {
+        ui.set_min_height(crate::theme::TARGET);
+        if picked.is_empty() {
+            ui.add(egui::Label::new(text(Type::Caption, tr!("Ctrl+click steps to save them as a command"))).wrap());
+        } else {
+            if ui.button(tr!("Save As Command…")).on_hover_text(tr!("Keep the picked steps as a command in the Commands menu, to run on any selection")).clicked() {
+                save = true;
+            }
+            ui.label(text(Type::Caption, trn!("{n} step picked", "{n} steps picked", picked.len())));
+            if ui.small_button(tr!("Clear")).on_hover_text(tr!("Unpick every step")).clicked() {
+                crate::macros_ui::clear_picks(app);
             }
         }
     });
+    if let Some((i, toggle, range)) = pick {
+        crate::macros_ui::pick(app, i, toggle, range);
+    }
+    if save {
+        crate::macros_ui::open_save(app);
+    }
     if let Some(t) = target
         && let Err(e) = app.s.travel_to(t)
     {
@@ -619,8 +784,15 @@ pub(crate) fn properties(app: &mut App, ui: &mut egui::Ui) {
     // The selection on every layer (ADR 0044).
     let sel: Vec<_> = app.s.selected_elements().into_iter().map(|(_, e)| e).collect();
 
+    // ---- while typing on the stage: the selected characters' style (ADR 0085) ----
+    app.text_props_rect = None;
+    if let Some(title) = app.text_edit.as_ref().map(crate::rich_edit::title) {
+        section(ui, "prop_text_selection", Section::Rule, &title, None, |ui| crate::rich_edit::selection_rows(app, ui));
+    }
     // ---- tool options first while a drawing tool is in hand: they're what you reach for ----
-    if matches!(app.tool, Tool::Rect | Tool::Oval | Tool::Star | Tool::Line | Tool::Pen | Tool::Text | Tool::Pencil | Tool::Brush | Tool::PaintBrush | Tool::Eraser | Tool::PaintBucket | Tool::InkBottle | Tool::Eyedropper | Tool::Pixel) {
+    // (While typing, the selected characters' section above takes the Text tool's place.)
+    let typing = app.text_edit.is_some();
+    if (!typing || app.tool != Tool::Text) && matches!(app.tool, Tool::Rect | Tool::Oval | Tool::Star | Tool::Line | Tool::Pen | Tool::Text | Tool::Pencil | Tool::Brush | Tool::PaintBrush | Tool::Eraser | Tool::PaintBucket | Tool::InkBottle | Tool::Eyedropper | Tool::Pixel) {
         let title = tr!("{tool} tool", tool = crate::i18n::t(app.tool.label()));
         section(ui, "prop_tool", Section::Rule, &title, None, |ui| tool_props(app, ui));
     }
@@ -634,6 +806,10 @@ pub(crate) fn properties(app: &mut App, ui: &mut egui::Ui) {
             });
             if on != app.s.style.snap_objects {
                 app.run("draw.snap_to_objects", json!({"on": on}));
+            }
+            // What several selected objects turn and scale about (ADR 0109, #296).
+            if app.tool == Tool::Transform {
+                transform_origin_row(app, ui);
             }
         });
     }
@@ -657,6 +833,14 @@ pub(crate) fn properties(app: &mut App, ui: &mut egui::Ui) {
     });
     if app.tool == Tool::Warp || warp_target.is_some() {
         section(ui, "prop_warp", Section::Rule, tr!("Asset Warp"), None, |ui| warp_props(app, ui, warp_target));
+    }
+    // The selected layer (ADR 0123), above the selection so it is in view when a layer is chosen.
+    if app.layer_name_focus.is_some() {
+        let key = ui.make_persistent_id(("section", "prop_layer"));
+        ui.data_mut(|d| d.insert_temp(key, true));
+    }
+    if let Some(layer_name) = app.s.active_layer().map(|l| l.name.clone()) {
+        section(ui, "prop_layer", Section::Rule, tr!("Layer"), Some(&layer_name), |ui| crate::layer_props::fields(app, ui));
     }
     if let Some(e) = sel.first() {
         // One count per template: the layers' phrase is its own plural, with its preposition, so
@@ -706,6 +890,49 @@ fn blend_row(app: &mut App, ui: &mut egui::Ui, current: anicraft_engine::doc::Bl
     });
 }
 
+/// A transformation origin's name, as Properties and the status line show it.
+pub(crate) fn transform_origin_label(mode: anicraft_engine::TransformOrigin) -> &'static str {
+    match mode {
+        anicraft_engine::TransformOrigin::Selection => tr!("The whole selection"),
+        anicraft_engine::TransformOrigin::Registration => tr!("Each object's own point"),
+        anicraft_engine::TransformOrigin::Center => tr!("Each object's centre"),
+    }
+}
+
+/// What each transformation origin does, for its tooltip.
+fn transform_origin_tip(mode: anicraft_engine::TransformOrigin) -> &'static str {
+    match mode {
+        anicraft_engine::TransformOrigin::Selection => tr!("The selected objects turn, scale and skew together, as one arrangement"),
+        anicraft_engine::TransformOrigin::Registration => tr!("Each selected object turns, scales and skews where it stands: a symbol or group about its registration point, anything else about its centre"),
+        anicraft_engine::TransformOrigin::Center => tr!("Each selected object turns, scales and skews about the centre of its own box"),
+    }
+}
+
+/// The Free Transform tool's Transform about row: the mode stays as set from one selection to
+/// the next (`modify.transform_origin`; the same command on a key moves to the next mode).
+fn transform_origin_row(app: &mut App, ui: &mut egui::Ui) {
+    let current = app.s.style.transform_origin;
+    let key = app.keymap.primary("modify.transform_origin").map(crate::platform::shortcut_label).filter(|k| !k.is_empty());
+    row_prose(ui, tr!("Transform about"), |ui| {
+        let tip = match &key {
+            Some(k) => tr!("What several selected objects are transformed about. {key} moves to the next choice.", key = k),
+            None => tr!("What several selected objects are transformed about. Give Modify › Transform › Next Transformation Origin a key in the shortcut editor to change it from the keyboard.").to_string(),
+        };
+        egui::ComboBox::from_id_salt("prop_transform_origin")
+            .selected_text(transform_origin_label(current))
+            .show_ui(ui, |ui| {
+                for mode in anicraft_engine::TransformOrigin::ALL {
+                    if ui.selectable_label(mode == current, transform_origin_label(mode)).on_hover_text(transform_origin_tip(mode)).clicked() && mode != current {
+                        app.run("modify.transform_origin", json!({"mode": mode.key()}));
+                    }
+                }
+            })
+            .response
+            .on_hover_text(tip)
+            .set_name(tr!("Transform about"));
+    });
+}
+
 /// A symbol type's name, as the Properties panel shows it.
 pub(crate) fn symbol_kind_label(kind: SymbolKind) -> &'static str {
     match kind {
@@ -738,6 +965,28 @@ pub(crate) fn element_title(doc: &anicraft_engine::doc::Document, e: &anicraft_e
         }
     };
     if e.name.is_empty() { kind } else { tr!("{name} ({kind})", name = e.name, kind = kind) }
+}
+
+/// The thinnest stroke the Stroke width field makes (Animate's hairline); the Stroke checkbox
+/// removes a stroke (#393).
+const STROKE_HAIRLINE: f32 = 0.1;
+
+/// The Scale lock's link (#304): with the lock on, editing one Scale axis (percent, as the
+/// Properties panel shows it) adjusts the other so the selection keeps its width:height
+/// proportion (multiplicative, not forced equal). `x_changed` says which axis was edited.
+/// A degenerate old axis (near zero) cannot divide, so the other axis follows the new value
+/// instead. Both sizes are clamped to 1–10000 %, so a typed extreme cannot produce a zero
+/// scale; a negative scale is a mirror (#116) and each axis keeps its own direction.
+fn linked_scale(old: (f32, f32), now: (f32, f32), x_changed: bool) -> (f32, f32) {
+    const MIN: f32 = 1.0;
+    const MAX: f32 = 10000.0;
+    // The size follows in proportion; each axis keeps its own direction (a mirrored axis stays
+    // mirrored, and flipping one axis does not flip the other).
+    let size = |v: f32| v.abs().clamp(MIN, MAX);
+    let follow = |from: f32, to: f32, other: f32| if from.abs() <= 1e-6 { size(to).copysign(other) } else { size(other * to / from).copysign(other) };
+    let (ox, oy) = old;
+    let (nx, ny) = now;
+    if x_changed { (size(nx).copysign(nx), follow(ox, nx, oy)) } else { (follow(oy, ny, ox), size(ny).copysign(ny)) }
 }
 
 /// "mixed" after a value that differs across the selection (the field shows the first one's).
@@ -893,13 +1142,58 @@ fn selection_props(app: &mut App, ui: &mut egui::Ui, e: &anicraft_engine::doc::E
                 }
             });
         }
+        // Size (#294): the selection's box in stage pixels, as Animate's W and H. A change
+        // stretches the artwork from the box's top-left corner, which stays where it is.
+        let sb = app.s.selection_bounds();
+        if !sb.is_empty() && !matches!(e.kind, ElementKind::Camera) {
+            let (w0, h0) = (sb.max.x - sb.min.x, sb.max.y - sb.min.y);
+            let (mut w, mut h) = (w0, h0);
+            row(ui, tr!("Size"), |ui| {
+                let a = ui.add(egui::DragValue::new(&mut w).prefix("W ").speed(1.0).range(SIZE_RANGE).clamp_existing_to_range(false).max_decimals(1)).named(tr!("Width"));
+                let c = ui.add(egui::DragValue::new(&mut h).prefix("H ").speed(1.0).range(SIZE_RANGE).clamp_existing_to_range(false).max_decimals(1)).named(tr!("Height"));
+                if (a.changed() || c.changed())
+                    && let Some(m) = resize_affine([sb.min.x, sb.min.y, sb.max.x, sb.max.y], w, h)
+                {
+                    live(app, tr_noop!("Resize"), "modify.transform", json!({"a": m[0], "b": m[1], "c": m[2], "d": m[3], "e": m[4], "f": m[5]}));
+                }
+            });
+        }
         row(ui, tr!("Scale"), |ui| {
-            let a = ui.add(egui::DragValue::new(&mut sx).suffix(" %").speed(0.5).range(1.0..=10000.0).max_decimals(1)).named(tr!("Scale width"));
-            let b = ui.add(egui::DragValue::new(&mut sy).suffix(" %").speed(0.5).range(1.0..=10000.0).max_decimals(1)).named(tr!("Scale height"));
+            let (sx0, sy0) = (sx, sy);
+            // Negative is a mirror (Flip). Only edits are clamped: a scale merely shown is never
+            // rewritten (#116). The engine refuses a scale too near zero.
+            // Whole percentages without a decimal ("100 %"), so both fields, the lock and the
+            // mixed mark fit beside the label at the dock's default width.
+            let percent = |v: f64, _: std::ops::RangeInclusive<usize>| if (v - v.round()).abs() < 0.05 { format!("{v:.0}") } else { format!("{v:.1}") };
+            let a = ui
+                .add(egui::DragValue::new(&mut sx).suffix(" %").speed(0.5).range(-10000.0..=10000.0).clamp_existing_to_range(false).max_decimals(1).custom_formatter(percent))
+                .named(tr!("Scale width"));
+            let b = ui
+                .add(egui::DragValue::new(&mut sy).suffix(" %").speed(0.5).range(-10000.0..=10000.0).clamp_existing_to_range(false).max_decimals(1).custom_formatter(percent))
+                .named(tr!("Scale height"));
+            // The Scale lock (#304): view state, off by default. On, editing one axis scales
+            // the other so the selection keeps its width:height proportion.
+            let locked = app.scale_lock;
+            // Narrow and close to the fields, so the row still fits beside its label in the dock.
+            ui.spacing_mut().item_spacing.x = 4.0;
+            let lock = crate::timeline::icon_button_wide(ui, tr!("Lock scale"), Some(locked), if locked { Icon::Lock } else { Icon::Unlock }, 20.0);
+            if lock.clicked() {
+                app.scale_lock = !locked;
+            }
+            ui.ctx().data_mut(|d| d.insert_temp(egui::Id::new("scale_lock_geometry"), (a.rect, b.rect, lock.rect)));
             if a.changed() || b.changed() {
+                if locked {
+                    (sx, sy) = linked_scale((sx0, sy0), (sx, sy), a.changed());
+                }
                 live(app, tr_noop!("Scale"), "element.set_transform", json!({"sx": sx / 100.0, "sy": sy / 100.0}));
             }
-            mixed(ui, m.scale);
+            // Two fields and the lock fill the row: "mixed" as one faint mark (its hover says it
+            // in words), so the values stay beside their label instead of wrapping under it.
+            if m.scale {
+                ui.label(text(Type::Caption, "≠").color(T.text_faint))
+                    .on_hover_text(tr!("The selected elements differ here; it shows the first one's. A change applies to all of them"))
+                    .named(tr!("mixed"));
+            }
         });
         row(ui, tr!("Rotation"), |ui| {
             if ui.add(egui::DragValue::new(&mut rot).suffix("°").speed(0.5).range(-360.0..=360.0).max_decimals(1)).named(tr!("Rotation")).changed() {
@@ -907,14 +1201,38 @@ fn selection_props(app: &mut App, ui: &mut egui::Ui, e: &anicraft_engine::doc::E
             }
             mixed(ui, m.rotation);
         });
+        // The transformation point (ADR 0111): one symbol instance keeps its own, and the
+        // fields above (and Free Transform, and tweens) then turn and scale it about it.
+        if !many
+            && matches!(e.kind, ElementKind::Symbol { .. })
+            && let Some((at, moved)) = app.s.transformation_point()
+        {
+            let (mut px, mut py) = (at.x, at.y);
+            row(ui, tr!("Pivot"), |ui| {
+                let tip = tr!("The transformation point (the white circle Free Transform shows): what this instance turns, scales and skews about, on the stage, here and in tweens. Drag the circle with Free Transform, or set it here");
+                let a = ui.add(egui::DragValue::new(&mut px).prefix("X ").speed(1.0).max_decimals(1)).named(tr!("Transformation point X")).on_hover_text(tip);
+                let b = ui.add(egui::DragValue::new(&mut py).prefix("Y ").speed(1.0).max_decimals(1)).named(tr!("Transformation point Y")).on_hover_text(tip);
+                if a.changed() || b.changed() {
+                    live(app, tr_noop!("Move Transformation Point"), "modify.transformation_point", json!({"x": px, "y": py}));
+                }
+                // Back to the centre (double-clicking the circle does the same).
+                ui.spacing_mut().item_spacing.x = 4.0;
+                if ui.add_enabled(moved, egui::Button::new(text(Type::Label, tr!("Reset")))).on_hover_text(tr!("Put the transformation point back at the centre")).named(tr!("Reset transformation point")).clicked() {
+                    app.run("modify.reset_transformation_point", json!({}));
+                }
+            });
+        }
         if !matches!(e.kind, ElementKind::Camera) {
             colour_effect_rows(app, ui, &e.color, m.color, EffectOf::Selection);
         }
-        // Blending and filters, on movie clips and buttons.
+        // Blending and filters, on movie clips and buttons; filters on text too (ADR 0099).
         if let ElementKind::Symbol { symbol, filters, .. } = &e.kind
             && app.s.doc.symbol(*symbol).is_some_and(|x| x.kind != SymbolKind::Graphic)
         {
             filter_rows(app, ui, filters, m.filters);
+        }
+        if let ElementKind::Text(t) = &e.kind {
+            filter_rows(app, ui, &t.filters, m.filters);
         }
         if let ElementKind::Symbol { symbol, blend, .. } = &e.kind
             && app.s.doc.symbol(*symbol).is_some_and(|x| x.kind != SymbolKind::Graphic)
@@ -931,9 +1249,9 @@ fn selection_props(app: &mut App, ui: &mut egui::Ui, e: &anicraft_engine::doc::E
             row_prose(ui, tr!("Type"), |ui| {
                 egui::ComboBox::from_id_salt("prop_symkind").width(crate::theme::fit(ui, 150.0)).selected_text(symbol_kind_label(kind)).show_ui(ui, |ui| {
                     for (k, id, tip) in [
-                        (SymbolKind::Graphic, "graphic", tr!("Keeps step with the timeline it is on (looping options below)")),
                         (SymbolKind::MovieClip, "movie_clip", tr!("Plays its own timeline on a loop, from when it appears")),
                         (SymbolKind::Button, "button", tr!("Shows its Up frame")),
+                        (SymbolKind::Graphic, "graphic", tr!("Keeps step with the timeline it is on (looping options below)")),
                     ] {
                         if ui.selectable_label(kind == k, symbol_kind_label(k)).on_hover_text(tip).clicked() && (kind != k || m.kind) {
                             // Every selected instance's symbol (ADR 0053), or just this one's.
@@ -1023,13 +1341,32 @@ fn selection_props(app: &mut App, ui: &mut egui::Ui, e: &anicraft_engine::doc::E
             // A field's lines wrap by its line type, at its box (rows above); static text by width.
             let mut width = t.width;
             let wrap = if t.field.is_some() { None } else { Some(&mut width) };
-            if let Some((label, p)) = text_style_rows(app, ui, &mut st, wrap) {
+            // The whole block's characters: what they share, and "mixed" where they differ.
+            let n = t.char_count();
+            let sum = anicraft_engine::doc::rich_text::summarize(&t.styled_runs(), 0, n);
+            let paras = t.paragraph_styles();
+            let p0 = paras.first().copied().unwrap_or_default();
+            let mx = TextMixed {
+                font: sum.font.is_none(),
+                size: sum.size.is_none(),
+                color: sum.color.is_none(),
+                bold: sum.bold.is_none(),
+                italic: sum.italic.is_none(),
+                letter_spacing: sum.letter_spacing.is_none(),
+                align: paras.iter().any(|p| p.align != p0.align),
+                line_spacing: paras.iter().any(|p| p.line_spacing != p0.line_spacing),
+            };
+            if let Some((label, p)) = text_style_rows(app, ui, &mut st, wrap, Some(&mx)) {
+                live(app, label, "text.edit", p);
+            }
+            let mut extra = TextExtra { shift: sum.shift, underline: sum.underline, url: sum.url.clone(), indent: p0.indent, left_margin: p0.left_margin, right_margin: p0.right_margin, layout_mixed: paras.iter().any(|p| p.indent != p0.indent || p.left_margin != p0.left_margin || p.right_margin != p0.right_margin) };
+            if let Some((label, p)) = text_more_rows(ui, &mut extra) {
                 live(app, label, "text.edit", p);
             }
             row_prose(ui, tr!("Text"), |ui| {
-                if ui.button(tr!("Edit Text")).on_hover_text(tr!("Type on the stage (or double-click the text)")).clicked() {
+                if ui.button(tr!("Edit Text")).on_hover_text(tr!("Type on the stage (or double-click the text); select characters to style them on their own")).clicked() {
                     let at = e.transform.apply(anicraft_engine::geom::Vec2::ZERO);
-                    app.text_edit = Some(crate::app::TextEditing { at: pos2(at.x, at.y), element: Some(e.id), text: t.text.clone(), original: t.text.clone(), focus: true });
+                    app.text_edit = Some(crate::app::TextEditing::new(pos2(at.x, at.y), Some(e.id), Some(t), &app.s.text_style));
                 }
             });
             text_path_rows(app, ui, e, t);
@@ -1039,22 +1376,22 @@ fn selection_props(app: &mut App, ui: &mut egui::Ui, e: &anicraft_engine::doc::E
             let fill = sh.fill.as_ref().map(Paint::primary_color);
             let bitmaps = crate::colour_panel::bitmaps(app);
             row(ui, tr!("Fill"), |ui| {
-                let c = fill.unwrap_or(Rgba::WHITE);
                 // The one colour picker, with the fill's type (ADR 0074): a gradient shows as its
                 // ramp here and is edited in the picker.
                 let (r, edit) = crate::colour_panel::swatch(ui, sh.fill.as_ref(), &bitmaps);
                 r.named(tr!("Fill colour")).on_hover_text(tr!("Fill: click for its colour and how clear it is, or a gradient or bitmap fill"));
                 match edit {
                     Some(crate::colour_panel::FillEdit::Solid(p)) => live(app, tr_noop!("Fill colour"), "element.set_fill", json!({"color": crate::colour::to_hex(p, true)})),
+                    // Off, then on again: the fill it had comes back, not white (#292).
                     Some(crate::colour_panel::FillEdit::None(n)) => {
-                        app.run("element.set_fill", if n { json!({"color": null}) } else { json!({"color": crate::colour::to_hex(rgba(c), true)}) });
+                        app.run("element.set_fill", json!({"on": !n}));
                     }
                     Some(edit) => crate::colour_panel::apply_set(app, &edit, true),
                     None => {}
                 }
                 let mut on = fill.is_some();
                 if crate::theme::checkbox(ui, &mut on, "").named(tr!("Fill")).on_hover_text(tr!("Fill on/off")).changed() {
-                    app.run("element.set_fill", if on { json!({"color": crate::colour::to_hex(rgba(c), true)}) } else { json!({"color": null}) });
+                    app.run("element.set_fill", json!({"on": on}));
                 }
                 if let Some(what) = fill_kind_label(sh.fill.as_ref()) {
                     ui.label(text(Type::Caption, what));
@@ -1065,13 +1402,20 @@ fn selection_props(app: &mut App, ui: &mut egui::Ui, e: &anicraft_engine::doc::E
                 bitmap_row(app, ui, *bitmap, m.bitmap);
             }
             let mut sc = rgba(sh.stroke.as_ref().map_or(app.s.style.stroke, |s| s.color));
-            let mut sw = sh.stroke.as_ref().map_or(0.0, |s| s.width);
+            let mut sw = sh.stroke.as_ref().map_or(app.s.style.stroke_width, |s| s.width);
             row(ui, tr!("Stroke"), |ui| {
                 if crate::colour::button_alpha(ui, &mut sc).named(tr!("Stroke colour")).on_hover_text(tr!("Stroke colour: click to pick the colour and how clear it is")).changed() {
                     live(app, tr_noop!("Stroke colour"), "element.set_stroke", json!({"color": crate::colour::to_hex(sc, true)}));
                 }
-                if ui.add(egui::DragValue::new(&mut sw).suffix(" px").speed(0.1).range(0.0..=200.0).max_decimals(1)).named(tr!("Stroke width")).changed() {
-                    live(app, tr_noop!("Stroke width"), "element.set_stroke", json!({"width": sw}));
+                // On/off like the fill, so the width can stop at a hairline: dragging it all the
+                // way down lands on 0.1 instead of removing the stroke (#393). A width already
+                // below that (an import) shows as it is until it is changed.
+                let mut on = sh.stroke.is_some();
+                if crate::theme::checkbox(ui, &mut on, "").named(tr!("Stroke")).on_hover_text(tr!("Stroke on/off")).changed() {
+                    app.run("element.set_stroke", json!({"on": on}));
+                }
+                if ui.add(egui::DragValue::new(&mut sw).suffix(" px").speed(0.1).range(STROKE_HAIRLINE..=200.0).clamp_existing_to_range(false).max_decimals(1)).named(tr!("Stroke width")).on_hover_text(tr!("Stroke width: drag all the way down for a hairline")).changed() {
+                    live(app, tr_noop!("Stroke width"), "element.set_stroke", json!({"width": sw.max(STROKE_HAIRLINE)}));
                 }
                 mixed(ui, m.stroke);
             });
@@ -1303,6 +1647,7 @@ pub fn sync_filter_presets(app: &mut App) {
         return;
     }
     app.prefs.filter_presets = app.s.filter_presets.clone();
+    app.prefs.filter_presets_hidden = app.s.filter_presets.hidden().to_vec();
     if app.shot.is_none()
         && let Err(e) = app.prefs.save()
     {
@@ -1319,6 +1664,8 @@ enum FilterAct {
     Paste,
     Apply(String),
     Delete(String),
+    /// Hide a built-in preset from the menu, or show it again.
+    Hide(String, bool),
 }
 
 /// A filter's grip: drag it up or down the list to reorder, or, focused, Alt+Up and Alt+Down
@@ -1359,7 +1706,10 @@ fn filter_rows(app: &mut App, ui: &mut egui::Ui, current: &[anicraft_engine::doc
     let n = list.len();
     let mut changed: Option<&'static str> = None;
     let mut act: Option<FilterAct> = None;
-    let presets: Vec<(String, String)> = app.s.filter_presets.presets().iter().map(|p| (p.name.clone(), p.filters.iter().map(|f| crate::i18n::t(f.filter.label())).collect::<Vec<_>>().join(", "))).collect();
+    let what = |p: &anicraft_engine::filter_library::FilterPreset| p.filters.iter().map(|f| crate::i18n::t(f.filter.label())).collect::<Vec<_>>().join(", ");
+    let presets: Vec<(String, String)> = app.s.filter_presets.presets().iter().map(|p| (p.name.clone(), what(p))).collect();
+    // The built-in presets (ADR 0099): name, what is in it, and whether the menu lists it.
+    let builtin: Vec<(&'static str, String, bool)> = anicraft_engine::filter_library::BUILTIN_NAMES.into_iter().zip(anicraft_engine::filter_library::builtins().iter()).map(|(name, p)| (name, what(p), !app.s.filter_presets.is_hidden(name))).collect();
     let copied = app.s.filter_clipboard.as_ref().map_or(0, Vec::len);
     let mut naming = app.filter_naming.name.clone();
     row_prose(ui, tr!("Filters"), |ui| {
@@ -1377,6 +1727,20 @@ fn filter_rows(app: &mut App, ui: &mut egui::Ui, current: &[anicraft_engine::doc
         .set_name(tr!("Add filter"));
         let pr = crate::timeline::icon_button(ui, tr!("Filter presets: apply, save, rename, delete, import, export"), None, Icon::Folder);
         egui::Popup::menu(&pr).id(egui::Id::new("anicraft.filters.presets")).show(|ui| {
+            // The built-in presets the menu lists, then your own.
+            let shown: Vec<&(&'static str, String, bool)> = builtin.iter().filter(|b| b.2).collect();
+            if !shown.is_empty() {
+                ui.label(text(Type::Caption, tr!("Built-in")));
+            }
+            for (name, what, _) in shown.iter().copied() {
+                if ui.button(crate::i18n::t(name)).on_hover_text(tr!("Apply: {filters} (replaces the filters)", filters = what.as_str())).clicked() {
+                    act = Some(FilterAct::Apply((*name).to_string()));
+                }
+            }
+            if !shown.is_empty() {
+                ui.separator();
+                ui.label(text(Type::Caption, tr!("Yours")));
+            }
             if presets.is_empty() {
                 ui.label(text(Type::Caption, tr!("No presets yet. Set up filters, then Save as Preset.")));
             }
@@ -1386,6 +1750,16 @@ fn filter_rows(app: &mut App, ui: &mut egui::Ui, current: &[anicraft_engine::doc
                 }
             }
             ui.separator();
+            // Built-in presets can't be deleted: untick one to take it off this menu.
+            ui.menu_button(tr!("Built-in Presets"), |ui| {
+                ui.label(text(Type::Caption, tr!("Untick one to hide it from this menu")));
+                for (name, _, listed) in &builtin {
+                    let mut on = *listed;
+                    if crate::theme::checkbox(ui, &mut on, crate::i18n::t(name)).named(&tr!("Show the built-in preset {name}", name = crate::i18n::t(name))).changed() {
+                        act = Some(FilterAct::Hide((*name).to_string(), !on));
+                    }
+                }
+            });
             if ui.add_enabled(n > 0, egui::Button::new(tr!("Save as Preset…"))).on_hover_text(tr!("Keep these filters under a name, for any document")).clicked() {
                 naming = Some((String::new(), None));
             }
@@ -1660,6 +2034,9 @@ fn filter_rows(app: &mut App, ui: &mut egui::Ui, current: &[anicraft_engine::doc
                 app.run("filter.preset_apply", json!({"name": name}));
             }
             FilterAct::Delete(name) => app.request("filter.preset_delete", json!({"name": name})),
+            FilterAct::Hide(name, hidden) => {
+                app.run("filter.preset_hide", json!({"name": name, "hidden": hidden}));
+            }
         }
         return;
     }
@@ -1877,10 +2254,101 @@ fn ramp_editor(ui: &mut egui::Ui, fname: &str, stops: &mut Vec<anicraft_engine::
     ui.data_mut(|d| d.insert_temp(sel_id, sel));
 }
 
+/// Which of the text style rows' values differ across the characters (or paragraphs) they show
+/// (ADR 0085): those rows show the first one's and say "mixed".
+#[derive(Clone, Copy, Debug, Default)]
+pub struct TextMixed {
+    pub font: bool,
+    pub size: bool,
+    pub color: bool,
+    pub bold: bool,
+    pub italic: bool,
+    pub letter_spacing: bool,
+    pub align: bool,
+    pub line_spacing: bool,
+}
+
+/// "mixed" after a text row whose characters differ.
+fn mixed_chars(ui: &mut egui::Ui, differs: bool) {
+    if differs {
+        ui.label(text(Type::Caption, tr!("mixed")).color(T.text_faint)).on_hover_text(tr!("The characters differ here; it shows the first one's. A change applies to all of them"));
+    }
+}
+
+/// The rest of a text's character and paragraph style (ADR 0085): baseline shift, underline,
+/// link, indent and margins. `None` values are mixed.
+#[derive(Clone, Debug, Default)]
+pub struct TextExtra {
+    pub shift: Option<anicraft_engine::doc::BaselineShift>,
+    pub underline: Option<bool>,
+    pub url: Option<String>,
+    pub indent: f32,
+    pub left_margin: f32,
+    pub right_margin: f32,
+    /// The paragraphs' indents or margins differ.
+    pub layout_mixed: bool,
+}
+
+/// Baseline shift, underline, link, indent and margin rows. Returns the edit made, as params
+/// (one key per change), with an undo label.
+pub fn text_more_rows(ui: &mut egui::Ui, x: &mut TextExtra) -> Option<(&'static str, Value)> {
+    use anicraft_engine::doc::BaselineShift;
+    let mut out: Option<(&'static str, Value)> = None;
+    row_prose(ui, tr!("Position"), |ui| {
+        let label = |s: BaselineShift| match s {
+            BaselineShift::Normal => tr!("Normal"),
+            BaselineShift::Superscript => tr!("Superscript"),
+            BaselineShift::Subscript => tr!("Subscript"),
+        };
+        let shown = x.shift.map_or_else(|| tr!("mixed").to_string(), |s| label(s).to_string());
+        egui::ComboBox::from_id_salt("text_shift").selected_text(shown).show_ui(ui, |ui| {
+            for s in BaselineShift::ALL {
+                if ui.selectable_label(x.shift == Some(s), label(s)).clicked() {
+                    x.shift = Some(s);
+                    out = Some((tr_noop!("Superscript and subscript"), json!({"shift": s.key()})));
+                }
+            }
+        })
+        .response
+        .set_name(tr!("Character position"));
+        // The letter on the button is the usual underline mark.
+        let on = x.underline == Some(true);
+        if ui.selectable_label(on, text(Type::Body, "U").underline()).named(tr!("Underline")).on_hover_text(tr!("Underline")).clicked() {
+            x.underline = Some(!on);
+            out = Some((tr_noop!("Underline"), json!({"underline": !on})));
+        }
+        mixed_chars(ui, x.underline.is_none());
+    });
+    row_prose(ui, tr!("Link"), |ui| {
+        let mut url = x.url.clone().unwrap_or_default();
+        let r = ui.add(egui::TextEdit::singleline(&mut url).desired_width(170.0).font(crate::theme::font(Type::Path)).hint_text(if x.url.is_none() { tr!("mixed") } else { tr!("https://…") })).named(tr!("Link")).on_hover_text(tr!("Where the characters link to in SVG and other exports; empty for no link"));
+        if r.lost_focus() && x.url.as_deref() != Some(url.trim()) {
+            x.url = Some(url.trim().to_string());
+            out = Some((tr_noop!("Text link"), json!({"url": url.trim()})));
+        }
+    });
+    row(ui, tr!("Indent"), |ui| {
+        if ui.add(egui::DragValue::new(&mut x.indent).suffix(" px").speed(0.5).range(-1000.0..=1000.0).max_decimals(1)).named(tr!("First-line indent")).on_hover_text(tr!("First-line indent")).changed() {
+            out = Some((tr_noop!("Indent"), json!({"indent": x.indent})));
+        }
+        mixed_chars(ui, x.layout_mixed);
+    });
+    row(ui, tr!("Margins"), |ui| {
+        if ui.add(egui::DragValue::new(&mut x.left_margin).prefix(format!("{} ", tr!("Left"))).suffix(" px").speed(0.5).range(0.0..=1000.0).max_decimals(1)).named(tr!("Left margin")).changed() {
+            out = Some((tr_noop!("Margins"), json!({"left_margin": x.left_margin})));
+        }
+        if ui.add(egui::DragValue::new(&mut x.right_margin).prefix(format!("{} ", tr!("Right"))).suffix(" px").speed(0.5).range(0.0..=1000.0).max_decimals(1)).named(tr!("Right margin")).changed() {
+            out = Some((tr_noop!("Margins"), json!({"right_margin": x.right_margin})));
+        }
+    });
+    out
+}
+
 /// Font, size, style, colour, alignment and spacing rows for text. Returns the edit made, as
 /// `text.edit` params (one key per change), with an undo label.
-pub fn text_style_rows(app: &mut App, ui: &mut egui::Ui, st: &mut anicraft_engine::cmds_text::TextStyle, width: Option<&mut Option<f32>>) -> Option<(&'static str, Value)> {
+pub fn text_style_rows(app: &mut App, ui: &mut egui::Ui, st: &mut anicraft_engine::cmds_text::TextStyle, width: Option<&mut Option<f32>>, mx: Option<&TextMixed>) -> Option<(&'static str, Value)> {
     use anicraft_engine::doc::TextAlign;
+    let mx = mx.copied().unwrap_or_default();
     let families = app.font_families.get_or_insert_with(|| anicraft_engine::text::Fonts::get().families().to_vec()).clone();
     let mut out: Option<(&'static str, Value)> = None;
     row_prose(ui, tr!("Font"), |ui| {
@@ -1898,6 +2366,7 @@ pub fn text_style_rows(app: &mut App, ui: &mut egui::Ui, st: &mut anicraft_engin
         })
         .response
         .set_name(tr!("Font"));
+        mixed_chars(ui, mx.font);
     });
     row(ui, tr!("Size"), |ui| {
         if ui.add(egui::DragValue::new(&mut st.size).suffix(" px").speed(0.25).range(1.0..=2000.0).max_decimals(1)).named(tr!("Font size")).changed() {
@@ -1908,6 +2377,7 @@ pub fn text_style_rows(app: &mut App, ui: &mut egui::Ui, st: &mut anicraft_engin
             st.color = Rgba::hex(u32::from(c[0]) << 16 | u32::from(c[1]) << 8 | u32::from(c[2]));
             out = Some((tr_noop!("Text colour"), json!({"color": hex(c)})));
         }
+        mixed_chars(ui, mx.size || mx.color);
     });
     row_prose(ui, tr!("Style"), |ui| {
         // The letters on the two buttons are the usual bold and italic marks.
@@ -1919,6 +2389,7 @@ pub fn text_style_rows(app: &mut App, ui: &mut egui::Ui, st: &mut anicraft_engin
             st.italic = !st.italic;
             out = Some((tr_noop!("Italic"), json!({"italic": st.italic})));
         }
+        mixed_chars(ui, mx.bold || mx.italic);
         ui.separator();
         for (a, label, name, key) in [(TextAlign::Left, tr!("Left"), tr!("Align left"), "left"), (TextAlign::Center, tr!("Centre"), tr!("Align centre"), "center"), (TextAlign::Right, tr!("Right"), tr!("Align right"), "right")] {
             if ui.selectable_label(st.align == a, label).named(name).on_hover_text(name).clicked() {
@@ -1926,6 +2397,7 @@ pub fn text_style_rows(app: &mut App, ui: &mut egui::Ui, st: &mut anicraft_engin
                 out = Some((tr_noop!("Text alignment"), json!({"align": key})));
             }
         }
+        mixed_chars(ui, mx.align);
     });
     row(ui, tr!("Spacing"), |ui| {
         if ui.add(egui::DragValue::new(&mut st.letter_spacing).prefix(format!("{} ", tr!("Letters"))).suffix(" px").speed(0.1).range(-1000.0..=1000.0).max_decimals(1)).named(tr!("Letter spacing")).changed() {
@@ -1934,6 +2406,7 @@ pub fn text_style_rows(app: &mut App, ui: &mut egui::Ui, st: &mut anicraft_engin
         if ui.add(egui::DragValue::new(&mut st.line_spacing).prefix(format!("{} ", tr!("Lines"))).suffix(" px").speed(0.1).range(-1000.0..=1000.0).max_decimals(1)).named(tr!("Line spacing")).changed() {
             out = Some((tr_noop!("Line spacing"), json!({"line_spacing": st.line_spacing})));
         }
+        mixed_chars(ui, mx.letter_spacing || mx.line_spacing);
     });
     if let Some(width) = width {
         row(ui, tr!("Width"), |ui| {
@@ -2135,7 +2608,7 @@ fn bone_props(app: &mut App, ui: &mut egui::Ui, id: anicraft_engine::doc::BoneId
         }
     });
     // A bone inside a shape (ADR 0071): how many of the shape's points it moves.
-    let skin = layer.armature.as_ref().and_then(|a| a.skin.as_ref()).map(|k| (k.points.iter().filter(|p| p.weight(id) > 0.0).count(), k.points.len()));
+    let skin = layer.armature.as_ref().and_then(|a| a.skin_of(id).map(|k| (a.bound_count(id), k.points.len())));
     if let Some((mine, total)) = skin {
         row(ui, tr!("Points"), |ui| {
             ui.label(text(Type::Data, format!("{mine} / {total}"))).on_hover_text(tr!("How many of the shape's points this bone moves. Adjust them with the Bind tool"));
@@ -2151,7 +2624,7 @@ fn bone_props(app: &mut App, ui: &mut egui::Ui, id: anicraft_engine::doc::BoneId
                 app.run("bone.bind", json!({"bone": id.0, "mode": "auto"}));
             }
         }
-        let hint = if skin.is_some() { tr!("Removes the bone and the bones below it; the shape's points follow the bones that are left") } else { tr!("Removes the bone and the bones below it; their instances stay where they are, on a layer of their own") };
+        let hint = if skin.is_some() { tr!("Removes the bone and the bones below it; the shape's points follow the bones that are left") } else { tr!("Removes the bone and the bones below it; what they moved stays where it is, on a layer of its own") };
         if ui.button(tr!("Remove Bone")).named(tr!("Remove bone")).on_hover_text(hint).clicked() {
             app.request("bone.remove", json!({"bone": id.0}));
         }
@@ -2201,7 +2674,7 @@ fn bind_props(app: &mut App, ui: &mut egui::Ui, id: anicraft_engine::doc::BoneId
         }
     });
     let arm = layer.armature.as_ref();
-    let binding = arm.and_then(|a| a.skin.as_ref()).and_then(|k| k.points.get(point)).cloned().unwrap_or_default();
+    let binding = arm.and_then(|a| a.skin_of(id)).and_then(|k| k.points.get(point)).cloned().unwrap_or_default();
     let mut w = binding.weight(id) * 100.0;
     row(ui, tr!("Weight"), |ui| {
         let r = ui.add(egui::DragValue::new(&mut w).suffix(" %").speed(0.5).range(0.0..=100.0).max_decimals(1)).named(tr!("Bone weight at the point"));
@@ -2569,7 +3042,7 @@ fn tool_props(app: &mut App, ui: &mut egui::Ui) {
     if app.tool == Tool::Text {
         // What new text gets (the last style used).
         let mut st = app.s.text_style.clone();
-        if text_style_rows(app, ui, &mut st, None).is_some() {
+        if text_style_rows(app, ui, &mut st, None, None).is_some() {
             app.s.text_style = st;
         }
         return;
@@ -2701,165 +3174,195 @@ fn polystar_props(app: &mut App, ui: &mut egui::Ui) {
     }
 }
 
-/// The Raster tool: stage pixels on a pixel layer, or a smudge of the colours already there.
+/// The Raster tool: the same square modules and dials as the Layer section (ADR 0125).
+/// Fill, pressure, erase, smudge and antialias are small squares. Size and the percents are dials.
+/// A picture brush hides spray, grain and lay. Smudge shows stretch instead. Pressure shows its range.
 fn pixel_props(app: &mut App, ui: &mut egui::Ui) {
+    use crate::layer_props::{self, Mode};
     if ui.button(tr!("New Raster Layer")).on_hover_text(tr!("Adds a transparent pixel layer the size of the stage. The Raster tool also adds one on the first stroke.")).clicked() {
         app.run("layer.new_raster", json!({}));
     }
     let bitmaps = crate::colour_panel::bitmaps(app);
     let mut st = app.s.style.clone();
-    let mut set = None;
-    row(ui, tr!("Fill"), |ui| {
-        let paint = st.fill_paint();
-        let (r, edit) = crate::colour_panel::swatch(ui, Some(&paint), &bitmaps);
-        r.named(tr!("Fill colour")).on_hover_text(tr!("The colour the pixel brush paints, the same fill as the vector brush. Its alpha is the opacity of the whole stroke."));
-        match edit {
-            Some(crate::colour_panel::FillEdit::Solid(p)) => {
-                st.set_fill_color(Rgba::new(f32::from(p[0]) / 255.0, f32::from(p[1]) / 255.0, f32::from(p[2]) / 255.0, f32::from(p[3]) / 255.0));
-                st.use_fill = true;
-            }
-            Some(crate::colour_panel::FillEdit::None(_)) => {}
-            other => set = other,
+    let pressure = app.pixel.pressure_opacity;
+    let smudge = app.pixel.smudge;
+    let marks = app.pixel.picture == anicraft_raster::Picture::None && !smudge;
+    let mut kinds = vec![false, false, false, false, false];
+    kinds.extend_from_slice(&[true, true, true, true]);
+    if pressure {
+        kinds.extend_from_slice(&[true, true]);
+    }
+    if marks {
+        kinds.extend_from_slice(&[true, true, true]);
+    }
+    if smudge {
+        kinds.push(true);
+    }
+    let dial_side = layer_props::cell_size(ui.available_width());
+    let chip = layer_props::chip_size(dial_side);
+    let rects = layer_props::place(ui, &kinds, dial_side, chip, 4.0);
+    let mut n = 0usize;
+    let mut take = || {
+        let rect = rects.get(n).copied().unwrap_or(Rect::ZERO);
+        n += 1;
+        rect
+    };
+    let paint = st.fill_paint();
+    let fill_rect = take();
+    let fill_resp = layer_props::hit(ui, "raster", "fill", fill_rect, Sense::click());
+    let fill_popup = fill_resp.id.with("colour_popup");
+    layer_props::face(ui, fill_rect, &fill_resp, egui::Popup::is_id_open(ui.ctx(), fill_popup));
+    let sw = layer_props::mark_rect(fill_rect);
+    crate::colour_panel::paint_preview(ui.painter(), sw, Some(&paint));
+    ui.painter().rect_stroke(sw, T.rc(), Stroke::new(1.0, T.border), StrokeKind::Inside);
+    layer_props::caption(ui, fill_rect, tr!("Fill"), false);
+    let fill_resp = fill_resp.on_hover_text(tr!("The colour the pixel brush paints, the same fill as the vector brush. Its alpha is the opacity of the whole stroke.")).named(tr!("Fill colour"));
+    match crate::colour_panel::popup_for(ui, &fill_resp, fill_popup, Some(&paint), &bitmaps) {
+        Some(crate::colour_panel::FillEdit::Solid(p)) => {
+            st.set_fill_color(Rgba::new(f32::from(p[0]) / 255.0, f32::from(p[1]) / 255.0, f32::from(p[2]) / 255.0, f32::from(p[3]) / 255.0));
+            st.use_fill = true;
+            app.s.style = st.clone();
         }
-    });
-    if let Some(edit) = set {
-        app.s.style = st;
-        crate::colour_panel::apply_set(app, &edit, false);
-        st = app.s.style.clone();
+        Some(edit @ crate::colour_panel::FillEdit::Set { .. }) => {
+            app.s.style = st.clone();
+            crate::colour_panel::apply_set(app, &edit, false);
+            st = app.s.style.clone();
+        }
+        _ => {}
+    }
+    let pressure_tip = tr!("Pen pressure sets the stroke's opacity, from Minimum to Maximum. Off: the fill colour's alpha is the opacity of the whole stroke.");
+    if layer_props::cube_toggle(ui, "raster", take(), pressure, tr!("Pressure opacity"), tr!("Pressure"), &pressure_tip, |p, r| {
+        let c = if pressure { T.text } else { T.text_faint };
+        let gap = 1.0;
+        let w = ((r.width() - gap * 2.0) / 3.0).max(1.0);
+        for i in 0..3 {
+            let h = r.height() * (0.4 + i as f32 * 0.3);
+            let x = r.left() + i as f32 * (w + gap);
+            p.rect_filled(Rect::from_min_size(pos2(x, r.bottom() - h), vec2(w, h)), 0.0, c);
+        }
+    })
+    .clicked()
+    {
+        app.pixel.pressure_opacity = !app.pixel.pressure_opacity;
+    }
+    let erase_tip = tr!("Punch out the paint instead of adding colour");
+    if layer_props::cube_toggle(ui, "raster", take(), app.pixel.erase, tr!("Erase"), tr!("Erase"), &erase_tip, |p, r| {
+        let c = if app.pixel.erase { T.text } else { T.text_faint };
+        p.circle_stroke(r.center(), r.width() * 0.42, Stroke::new(1.5, c));
+        p.line_segment([r.left_bottom(), r.right_top()], Stroke::new(1.5, c));
+    })
+    .clicked()
+    {
+        app.pixel.erase = !app.pixel.erase;
+    }
+    let smudge_tip = tr!("Blend the colours already on the pixel layer. Stretch sets how dry that blend is. It does not add a new colour.");
+    if layer_props::cube_toggle(ui, "raster", take(), smudge, tr!("Smudge"), tr!("Smudge"), &smudge_tip, |p, r| {
+        let c = if smudge { T.text } else { T.text_faint };
+        p.circle_filled(pos2(r.center().x - r.width() * 0.15, r.center().y), r.width() * 0.36, c.linear_multiply(0.45));
+        p.circle_stroke(pos2(r.center().x + r.width() * 0.12, r.center().y), r.width() * 0.28, Stroke::new(1.5, c));
+    })
+    .clicked()
+    {
+        app.pixel.smudge = !app.pixel.smudge;
+    }
+    let aa = if app.pixel.fringe <= 0.0 {
+        "0"
+    } else if (app.pixel.fringe - 0.5).abs() < 0.01 {
+        "0.5"
+    } else if (app.pixel.fringe - 1.0).abs() < 0.01 {
+        "1"
+    } else {
+        "2"
+    };
+    let aa_value = match aa {
+        "0" => tr!("Off"),
+        "1" => tr!("1"),
+        "2" => tr!("2"),
+        _ => tr!("0.5"),
+    };
+    let aa_modes = [
+        Mode { key: "0", label: tr!("Off"), allowed: true, tip: tr!("A hard edge") },
+        Mode { key: "0.5", label: tr!("0.5"), allowed: true, tip: tr!("A thin smoothed edge") },
+        Mode { key: "1", label: tr!("1"), allowed: true, tip: tr!("A smoothed edge one pixel wide") },
+        Mode { key: "2", label: tr!("2"), allowed: true, tip: tr!("A smoothed edge two pixels wide") },
+    ];
+    let aa_tip = tr!("How far the edge of a dab fades");
+    if let Some(k) = layer_props::mode_cell(ui, "raster", take(), aa, aa_value, tr!("Antialias"), tr!("Pixel brush antialias"), &aa_tip, &aa_modes) {
+        app.pixel.fringe = match k {
+            "0" => 0.0,
+            "1" => 1.0,
+            "2" => 2.0,
+            _ => 0.5,
+        };
+    }
+    let keys = [app.keymap.primary("view.brush_smaller"), app.keymap.primary("view.brush_larger")].into_iter().flatten().map(crate::platform::shortcut_label).collect::<Vec<_>>().join(" / ");
+    let size_tip_keys;
+    let size_tip = if keys.is_empty() {
+        tr!("How wide the brush is at a full press, in stage pixels. Drag up to raise it. Double-click returns it to 24")
+    } else {
+        size_tip_keys = tr!("How wide the brush is at a full press, in stage pixels ({keys}). Drag up to raise it. Double-click returns it to 24", keys = keys);
+        size_tip_keys.as_str()
+    };
+    if let Some(size) = layer_props::dial(ui, "raster", take(), f64::from(app.pixel.size), f64::from(crate::pixeltool::SIZE_MIN), f64::from(crate::pixeltool::SIZE_MAX), None, 24.0, 0, tr!("Pixel brush size"), tr!("Size"), &size_tip) {
+        app.pixel.size = size as f32;
+        if app.pixel.size_min > app.pixel.size {
+            app.pixel.size_min = app.pixel.size;
+        }
+    }
+    let thin_tip = tr!("The width of the lightest pen press. 0.05 is a hairline. Double-click returns it to the hairline");
+    let thin_end = f64::from(app.pixel.size.max(crate::pixeltool::THIN_MIN));
+    if let Some(thin) = layer_props::dial(ui, "raster", take(), f64::from(app.pixel.size_min), f64::from(crate::pixeltool::THIN_MIN), thin_end, None, f64::from(crate::pixeltool::THIN_MIN), 2, tr!("Pixel brush thinnest"), tr!("Thinnest"), &thin_tip) {
+        app.pixel.size_min = (thin as f32).clamp(crate::pixeltool::THIN_MIN, app.pixel.size);
+    }
+    let flow_tip = tr!("How much of the stroke one dab lays down. 100% keeps the strongest mark. Lower lets a pencil build up, still capped by the fill colour's alpha.");
+    if let Some(pct) = layer_props::dial(ui, "raster", take(), (f64::from(app.pixel.flow) * 100.0).round(), 0.0, 100.0, None, 100.0, 0, tr!("Raster flow"), tr!("Flow"), &flow_tip) {
+        app.pixel.flow = (pct as f32 / 100.0).clamp(0.0, 1.0);
+    }
+    let soft_tip = if smudge {
+        tr!("0 blends with a hard edge. 1 blends smoothly, pulling colour from further along the stroke.")
+    } else {
+        tr!("0 is a flat disc. 1 fades from the centre.")
+    };
+    if let Some(pct) = layer_props::dial(ui, "raster", take(), (f64::from(app.pixel.softness) * 100.0).round(), 0.0, 100.0, None, 0.0, 0, tr!("Pixel brush softness"), tr!("Softness"), &soft_tip) {
+        app.pixel.softness = (pct as f32 / 100.0).clamp(0.0, 1.0);
+    }
+    if pressure {
+        let min_tip = tr!("How clear a light press is, as a part of the fill colour's alpha. 0% is clear.");
+        let min_end = (f64::from(app.pixel.opacity_max) * 100.0).round().clamp(0.0, 100.0);
+        if let Some(pct) = layer_props::dial(ui, "raster", take(), (f64::from(app.pixel.opacity_min) * 100.0).round(), 0.0, min_end, None, 0.0, 0, tr!("Minimum opacity"), tr!("Minimum"), &min_tip) {
+            app.pixel.opacity_min = (pct as f32 / 100.0).clamp(0.0, app.pixel.opacity_max);
+        }
+        let max_tip = tr!("How opaque a full press is, as a part of the fill colour's alpha. 100% is the fill colour's alpha.");
+        let max_start = (f64::from(app.pixel.opacity_min) * 100.0).round().clamp(0.0, 100.0);
+        if let Some(pct) = layer_props::dial(ui, "raster", take(), (f64::from(app.pixel.opacity_max) * 100.0).round(), max_start, 100.0, None, 100.0, 0, tr!("Maximum opacity"), tr!("Maximum"), &max_tip) {
+            app.pixel.opacity_max = (pct as f32 / 100.0).clamp(app.pixel.opacity_min, 1.0);
+        }
+    }
+    if marks {
+        let spray_tip = tr!("Tiny dots of mixed size and opacity inside the brush, like spray paint. 0% is a solid dab. A soft brush keeps more of them near the middle.");
+        if let Some(pct) = layer_props::dial(ui, "raster", take(), (f64::from(app.pixel.speckle) * 100.0).round(), 0.0, 100.0, None, 0.0, 0, tr!("Raster spray"), tr!("Spray"), &spray_tip) {
+            app.pixel.speckle = (pct as f32 / 100.0).clamp(0.0, 1.0);
+        }
+        let grain_tip = tr!("Paper tooth. The same grain stays on the page, so a second pass catches the same spots. It shows most where the mark is soft.");
+        if let Some(pct) = layer_props::dial(ui, "raster", take(), (f64::from(app.pixel.grain) * 100.0).round(), 0.0, 100.0, None, 0.0, 0, tr!("Raster grain"), tr!("Grain"), &grain_tip) {
+            app.pixel.grain = (pct as f32 / 100.0).clamp(0.0, 1.0);
+        }
+        let lay_tip = tr!("How far the tip lies on its side. 0% is round. 100% is a wide pencil: a sharp edge, and a soft fade in the direction the stroke is going.");
+        if let Some(pct) = layer_props::dial(ui, "raster", take(), (f64::from(app.pixel.wedge) * 100.0).round(), 0.0, 100.0, None, 0.0, 0, tr!("Raster pencil lay"), tr!("Lay"), &lay_tip) {
+            app.pixel.wedge = (pct / 100.0).clamp(0.0, 1.0) as f32;
+        }
+    }
+    if smudge {
+        let stretch_tip = tr!("How dry the paint is. 0 stays put. 1 is the strongest drag, and it still fades instead of carrying the colour the whole stroke.");
+        let reset = (f64::from(crate::pixeltool::STRETCH_DEFAULT) * 100.0).round();
+        if let Some(pct) = layer_props::dial(ui, "raster", take(), (f64::from(app.pixel.stretch) * 100.0).round(), 0.0, 100.0, None, reset, 0, tr!("Paint stretch"), tr!("Stretch"), &stretch_tip) {
+            app.pixel.stretch = (pct as f32 / 100.0).clamp(0.0, 1.0);
+        }
     }
     app.s.style = st;
-    let keys = [app.keymap.primary("view.brush_smaller"), app.keymap.primary("view.brush_larger")].into_iter().flatten().map(crate::platform::shortcut_label).collect::<Vec<_>>().join(" / ");
-    row(ui, tr!("Size"), |ui| {
-        let r = ui.add(egui::DragValue::new(&mut app.pixel.size).suffix(" px").speed(1.0).range(crate::pixeltool::SIZE_MIN..=crate::pixeltool::SIZE_MAX).max_decimals(1)).named(tr!("Pixel brush size"));
-        if !keys.is_empty() {
-            r.on_hover_text(tr!("Pixel brush size ({keys})", keys = keys));
-        }
-    });
-    app.pixel.size_min = app.pixel.size_min.clamp(crate::pixeltool::THIN_MIN, app.pixel.size);
-    let thin_max = app.pixel.size;
-    row(ui, tr!("Thinnest"), |ui| {
-        ui.add(egui::DragValue::new(&mut app.pixel.size_min).suffix(" px").speed(0.01).range(crate::pixeltool::THIN_MIN..=thin_max).max_decimals(2))
-            .named(tr!("Pixel brush thinnest"))
-            .on_hover_text(tr!("The width of the lightest pen press. 0.05 is a hairline."));
-    });
-    row_prose(ui, tr!("Pressure"), |ui| {
-        crate::theme::checkbox(ui, &mut app.pixel.pressure_opacity, tr!("Opacity")).on_hover_text(tr!("Pen pressure sets the stroke's opacity, from Minimum to Maximum. Off: the fill colour's alpha is the opacity of the whole stroke."));
-    });
-    ui.add_enabled_ui(app.pixel.pressure_opacity, |ui| {
-        row(ui, tr!("Minimum"), |ui| {
-            let mut pct = app.pixel.opacity_min * 100.0;
-            let cap = app.pixel.opacity_max * 100.0;
-            if ui
-                .add(egui::DragValue::new(&mut pct).suffix(" %").speed(0.5).range(0.0..=cap).max_decimals(0))
-                .named(tr!("Minimum opacity"))
-                .on_hover_text(tr!("How clear a light press is, as a part of the fill colour's alpha. 0% is clear."))
-                .changed()
-            {
-                app.pixel.opacity_min = (pct / 100.0).clamp(0.0, app.pixel.opacity_max);
-            }
-        });
-        row(ui, tr!("Maximum"), |ui| {
-            let mut pct = app.pixel.opacity_max * 100.0;
-            let floor = app.pixel.opacity_min * 100.0;
-            if ui
-                .add(egui::DragValue::new(&mut pct).suffix(" %").speed(0.5).range(floor..=100.0).max_decimals(0))
-                .named(tr!("Maximum opacity"))
-                .on_hover_text(tr!("How opaque a full press is, as a part of the fill colour's alpha. 100% is the fill colour's alpha."))
-                .changed()
-            {
-                app.pixel.opacity_max = (pct / 100.0).clamp(app.pixel.opacity_min, 1.0);
-            }
-        });
-    });
-    row(ui, tr!("Flow"), |ui| {
-        let mut pct = app.pixel.flow * 100.0;
-        if ui
-            .add(egui::DragValue::new(&mut pct).suffix(" %").speed(0.5).range(0.0..=100.0).max_decimals(0))
-            .named(tr!("Raster flow"))
-            .on_hover_text(tr!("How much of the stroke one dab lays down. 100% keeps the strongest mark. Lower lets a pencil build up, still capped by the fill colour's alpha."))
-            .changed()
-        {
-            app.pixel.flow = (pct / 100.0).clamp(0.0, 1.0);
-        }
-    });
     if app.pixel.picture != anicraft_raster::Picture::None && !app.pixel.smudge {
         ui.label(text(Type::Caption, tr!("Each dab is this brush picture, turned.")).color(T.text_dim));
     }
-    ui.add_enabled_ui(app.pixel.picture == anicraft_raster::Picture::None && !app.pixel.smudge, |ui| {
-        row(ui, tr!("Spray"), |ui| {
-            let mut pct = app.pixel.speckle * 100.0;
-            if ui
-                .add(egui::DragValue::new(&mut pct).suffix(" %").speed(0.5).range(0.0..=100.0).max_decimals(0))
-                .named(tr!("Raster spray"))
-                .on_hover_text(tr!("Tiny dots of mixed size and opacity inside the brush, like spray paint. 0% is a solid dab. A soft brush keeps more of them near the middle."))
-                .changed()
-            {
-                app.pixel.speckle = (pct / 100.0).clamp(0.0, 1.0);
-            }
-        });
-        row(ui, tr!("Grain"), |ui| {
-            let mut pct = app.pixel.grain * 100.0;
-            if ui
-                .add(egui::DragValue::new(&mut pct).suffix(" %").speed(0.5).range(0.0..=100.0).max_decimals(0))
-                .named(tr!("Raster grain"))
-                .on_hover_text(tr!("Paper tooth. The same grain stays on the page, so a second pass catches the same spots. It shows most where the mark is soft."))
-                .changed()
-            {
-                app.pixel.grain = (pct / 100.0).clamp(0.0, 1.0);
-            }
-        });
-        row(ui, tr!("Lay"), |ui| {
-            let mut pct = app.pixel.wedge * 100.0;
-            if ui
-                .add(egui::DragValue::new(&mut pct).suffix(" %").speed(0.5).range(0.0..=100.0).max_decimals(0))
-                .named(tr!("Raster pencil lay"))
-                .on_hover_text(tr!("How far the tip lies on its side. 0% is round. 100% is a wide pencil: a sharp edge, and a soft fade in the direction the stroke is going."))
-                .changed()
-            {
-                app.pixel.wedge = (pct / 100.0).clamp(0.0, 1.0);
-            }
-        });
-    });
-    row(ui, tr!("Softness"), |ui| {
-        let help = if app.pixel.smudge {
-            tr!("0 blends with a hard edge. 1 blends smoothly, pulling colour from further along the stroke.")
-        } else {
-            tr!("0 is a flat disc. 1 fades from the centre.")
-        };
-        ui.add(egui::DragValue::new(&mut app.pixel.softness).speed(0.01).range(0.0..=1.0).fixed_decimals(2)).named(tr!("Pixel brush softness")).on_hover_text(help);
-    });
-    row_prose(ui, tr!("Antialias"), |ui| {
-        let label = if app.pixel.fringe <= 0.0 {
-            tr!("Off")
-        } else if (app.pixel.fringe - 0.5).abs() < 0.01 {
-            tr!("0.5")
-        } else if (app.pixel.fringe - 1.0).abs() < 0.01 {
-            tr!("1")
-        } else {
-            tr!("2")
-        };
-        egui::ComboBox::from_id_salt("pixel_aa").width(crate::theme::fit(ui, 120.0)).selected_text(label).show_ui(ui, |ui| {
-            ui.selectable_value(&mut app.pixel.fringe, 0.0, tr!("Off"));
-            ui.selectable_value(&mut app.pixel.fringe, 0.5, tr!("0.5"));
-            ui.selectable_value(&mut app.pixel.fringe, 1.0, tr!("1"));
-            ui.selectable_value(&mut app.pixel.fringe, 2.0, tr!("2"));
-        })
-        .response
-        .set_name(tr!("Pixel brush antialias"));
-    });
-    row_prose(ui, tr!("Erase"), |ui| {
-        crate::theme::checkbox(ui, &mut app.pixel.erase, tr!("Erase")).on_hover_text(tr!("Punch out the paint instead of adding colour"));
-    });
-    row_prose(ui, tr!("Smudge"), |ui| {
-        crate::theme::checkbox(ui, &mut app.pixel.smudge, tr!("Smudge")).on_hover_text(tr!("Blend the colours already on the pixel layer. Stretch sets how dry that blend is. It does not add a new colour."));
-    });
-    ui.add_enabled_ui(app.pixel.smudge, |ui| {
-        row(ui, tr!("Stretch"), |ui| {
-            ui.add(egui::DragValue::new(&mut app.pixel.stretch).speed(0.01).range(0.0..=1.0).fixed_decimals(2))
-                .named(tr!("Paint stretch"))
-                .on_hover_text(tr!("How dry the paint is. 0 stays put. 1 is the strongest drag, and it still fades instead of carrying the colour the whole stroke."));
-        });
-    });
 }
 
 /// The Eraser's options (ADR 0034): the Faucet, size, shape and erase mode, as in Animate.
@@ -3179,5 +3682,369 @@ mod tests {
         for t in [Tool::Pen, Tool::Rect, Tool::Oval, Tool::Star, Tool::Brush, Tool::PaintBucket] {
             assert!(!stroke_only(t), "{t:?} fills");
         }
+    }
+
+    #[test]
+    fn scene_breadcrumb_padding_click_exits_symbol() {
+        let ctx = egui::Context::default();
+        let session = anicraft_engine::Session::new(
+            anicraft_engine::doc::sample::demo()
+        );
+        let mut app = App::with_context(
+            &ctx,
+            session,
+            Some(std::path::PathBuf::from("unused.png")),
+        );
+
+        // Open a REAL library symbol for editing.
+        let symbol = app.s.doc.library.first()
+            .expect("Demo should contain a symbol")
+            .id.0;
+
+        assert!(app.run("symbol.edit", json!({"symbol": symbol})).is_some());
+        assert_eq!(app.s.editing.len(), 1);
+
+        let input = |events| egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(1200.0, 800.0),
+            )),
+            events,
+            ..Default::default()
+        };
+
+        // Draw the REAL edit bar so egui can measure its controls.
+        ctx.run_ui(input(vec![]), |ui| edit_bar(&mut app, ui))
+            .textures_delta.clear();
+
+        // Get the actual scene control's interaction rectangle.
+        let label_rect = ctx.data(|data| {
+            data.get_temp::<egui::Rect>(
+                egui::Id::new("test_scene_label_rect")
+            )
+        }).expect("Scene control rectangle should exist");
+
+        // Click near the scene button's left edge, away from the text.
+        let click = egui::pos2(
+            label_rect.left() + 2.0,
+            label_rect.center().y,
+        );
+        assert!(label_rect.contains(click));
+
+        // A real click involves a press and a release.
+        for pressed in [true, false] {
+            let events = vec![
+                egui::Event::PointerMoved(click),
+                egui::Event::PointerButton {
+                    pos: click,
+                    button: egui::PointerButton::Primary,
+                    pressed,
+                    modifiers: egui::Modifiers::NONE,
+                },
+            ];
+
+            ctx.run_ui(input(events), |ui| edit_bar(&mut app, ui))
+                .textures_delta.clear();
+        }
+
+        // Clicking the scene name should leave symbol-editing mode.
+        assert!(
+            app.s.editing.is_empty(),
+            "Clicking scene-label padding should return to the scene"
+        );
+    }
+
+    #[test]
+    fn scene_breadcrumb_arrow_opens_menu_without_exiting_symbol() {
+        let ctx = egui::Context::default();
+        let session = anicraft_engine::Session::new(
+            anicraft_engine::doc::sample::demo()
+        );
+        let mut app = App::with_context(
+            &ctx,
+            session,
+            Some(std::path::PathBuf::from("unused.png")),
+        );
+
+        // Open a REAL library symbol for editing.
+        let symbol = app.s.doc.library.first()
+            .expect("Demo should contain a symbol")
+            .id.0;
+
+        assert!(app.run("symbol.edit", json!({"symbol": symbol})).is_some());
+        assert_eq!(app.s.editing.len(), 1);
+
+        let input = |events| egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(1200.0, 800.0),
+            )),
+            events,
+            ..Default::default()
+        };
+
+        // Draw the edit bar once so egui can measure the dropdown arrow.
+        ctx.run_ui(input(vec![]), |ui| edit_bar(&mut app, ui))
+            .textures_delta.clear();
+
+        // Get the actual dropdown arrow's rectangle and widget ID.
+        let arrow_rect = ctx.data(|data| {
+            data.get_temp::<egui::Rect>(
+                egui::Id::new("test_scene_arrow_rect")
+            )
+        }).expect("Scene arrow rectangle should exist");
+
+        let arrow_id = ctx.data(|data| {
+            data.get_temp::<egui::Id>(
+                egui::Id::new("test_scene_arrow_id")
+            )
+        }).expect("Scene arrow ID should exist");
+
+        // Click the centre of the arrow control.
+        let click = arrow_rect.center();
+        assert!(arrow_rect.contains(click));
+
+        // A real click involves a press and a release.
+        for pressed in [true, false] {
+            let events = vec![
+                egui::Event::PointerMoved(click),
+                egui::Event::PointerButton {
+                    pos: click,
+                    button: egui::PointerButton::Primary,
+                    pressed,
+                    modifiers: egui::Modifiers::NONE,
+                },
+            ];
+
+            ctx.run_ui(input(events), |ui| edit_bar(&mut app, ui))
+                .textures_delta.clear();
+        }
+
+        // Clicking the arrow should open the menu without leaving the symbol.
+        assert_eq!(
+            app.s.editing.len(),
+            1,
+            "Clicking the arrow must not exit symbol-editing mode"
+        );
+
+        assert!(
+            egui::ComboBox::is_open(&ctx, arrow_id),
+            "Clicking the arrow should open the scene dropdown"
+        );
+    }
+
+    /// #304: the Scale lock keeps the width:height proportion (multiplicative).
+    #[test]
+    fn linked_scale_keeps_the_proportion() {
+        // 100x50, X edited to 200: the height doubles too.
+        assert_eq!(linked_scale((100.0, 50.0), (200.0, 50.0), true), (200.0, 100.0));
+        // 100x50, Y edited to 25: the width halves too.
+        assert_eq!(linked_scale((100.0, 50.0), (100.0, 25.0), false), (50.0, 25.0));
+        // A degenerate old axis cannot divide: the other axis follows the new value.
+        assert_eq!(linked_scale((0.0, 50.0), (200.0, 50.0), true), (200.0, 200.0));
+        assert_eq!(linked_scale((100.0, 0.0), (100.0, 25.0), false), (25.0, 25.0));
+        // Clamped to the DragValues' range, so an extreme cannot make a zero/negative scale.
+        assert_eq!(linked_scale((100.0, 100.0), (20000.0, 100.0), true), (10000.0, 10000.0));
+        assert_eq!(linked_scale((100.0, 200.0), (100.0, 0.01), false), (1.0, 1.0));
+        // A mirror (#116): the edited axis flips, the other keeps its direction and follows in size.
+        assert_eq!(linked_scale((100.0, 100.0), (-5.0, 100.0), true), (-5.0, 5.0));
+        assert_eq!(linked_scale((-100.0, 50.0), (-200.0, 50.0), true), (-200.0, 100.0));
+        assert_eq!(linked_scale((100.0, -50.0), (200.0, -50.0), true), (200.0, -100.0));
+    }
+
+    /// #304, headless: the lock toggle flips view state (one click), and the row's edit path
+    /// scales both axes proportionally in a single undo step; with the lock off only the
+    /// edited axis changes. Typing a value into a DragValue is not driven here (that needs a
+    /// focused text field plus key events): the value link itself is covered by
+    /// `linked_scale_keeps_the_proportion`, and this test drives the same helper plus the
+    /// same `element.set_transform` the row sends.
+    #[test]
+    fn scale_lock_toggle_links_the_axes_in_one_undo_step() {
+        use egui::{Event, Modifiers, PointerButton, Pos2};
+        let ctx = egui::Context::default();
+        let mut app = App::with_context(&ctx, anicraft_engine::Session::default(), Some(std::path::PathBuf::from("unused.png")));
+        app.run("draw.rect", json!({"x": 10, "y": 10, "w": 100, "h": 50, "fill": "#ff0000", "stroke": null}));
+        app.run("edit.select_all", json!({}));
+        assert!(!app.s.selection.is_empty());
+        assert!(!app.scale_lock, "the lock defaults off");
+        let screen = || egui::RawInput { screen_rect: Some(Rect::from_min_size(Pos2::ZERO, egui::vec2(1600.0, 1400.0))), ..Default::default() };
+        let frames = |ctx: &egui::Context, app: &mut App| {
+            for _ in 0..2 {
+                let mut out = ctx.run_ui(screen(), |ui| app.frame(ui));
+                out.textures_delta.clear();
+            }
+        };
+        frames(&ctx, &mut app);
+        let (_, _, lock_rect) = ctx.data(|d| d.get_temp::<(Rect, Rect, Rect)>(egui::Id::new("scale_lock_geometry"))).expect("the Scale row drew");
+        // Click the lock: view state only (no document change, no undo step).
+        let at = lock_rect.center();
+        let press = |pressed: bool| Event::PointerButton { pos: at, button: PointerButton::Primary, pressed, modifiers: Modifiers::NONE };
+        let steps = app.s.history_len();
+        let mut out = ctx.run_ui(screen(), |ui| app.frame(ui));
+        out.textures_delta.clear();
+        let mut out = ctx.run_ui(egui::RawInput { events: vec![Event::PointerMoved(at), press(true)], ..screen() }, |ui| app.frame(ui));
+        out.textures_delta.clear();
+        let mut out = ctx.run_ui(egui::RawInput { events: vec![press(false)], ..screen() }, |ui| app.frame(ui));
+        out.textures_delta.clear();
+        frames(&ctx, &mut app);
+        assert!(app.scale_lock, "one click turns the lock on");
+        assert_eq!(app.s.history_len(), steps, "toggling the lock is view state, not undoable");
+        // The row's locked path: X 100 % -> 200 % keeps the 1:1 proportion.
+        let (sx, sy) = linked_scale((100.0, 100.0), (200.0, 100.0), true);
+        let steps = app.s.history_len();
+        live(&mut app, tr_noop!("Scale"), "element.set_transform", json!({"sx": sx / 100.0, "sy": sy / 100.0}));
+        app.s.end_gesture();
+        assert_eq!(app.s.history_len(), steps + 1, "one undo step for the live edit");
+        let check = |app: &App| {
+            let els = app.s.selected_elements();
+            let d = els.first().expect("selected").1.transform.decompose();
+            (d.sx, d.sy)
+        };
+        let (sx, sy) = check(&app);
+        assert!((sx - 2.0).abs() < 1e-4 && (sy - 2.0).abs() < 1e-4, "both axes doubled, got ({sx}, {sy})");
+        app.s.undo().expect("undo");
+        let (sx, sy) = check(&app);
+        assert!((sx - 1.0).abs() < 1e-4 && (sy - 1.0).abs() < 1e-4, "one undo restores both, got ({sx}, {sy})");
+        // Lock off: the same row sends only the edited axis's change through.
+        app.scale_lock = false;
+        let steps = app.s.history_len();
+        live(&mut app, tr_noop!("Scale"), "element.set_transform", json!({"sx": 3.0, "sy": 1.0}));
+        app.s.end_gesture();
+        assert_eq!(app.s.history_len(), steps + 1);
+        let (sx, sy) = check(&app);
+        assert!((sx - 3.0).abs() < 1e-4 && (sy - 1.0).abs() < 1e-4, "only X changed, got ({sx}, {sy})");
+        app.s.undo().expect("undo");
+    }
+
+    use crate::app::App;
+    use anicraft_engine::Session;
+    use anicraft_engine::geom::Affine;
+    use serde_json::json;
+
+    /// A few headless frames of the whole window, Properties panel included.
+    fn frames(ctx: &egui::Context, app: &mut App) {
+        let input =
+            || egui::RawInput { screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1600.0, 940.0))), ..Default::default() };
+        for _ in 0..3 {
+            let mut out = ctx.run_ui(input(), |ui| app.frame(ui));
+            out.textures_delta.clear();
+        }
+    }
+
+    fn transform(app: &App) -> Affine {
+        app.s.visible_elements().first().map(|e| e.transform).unwrap_or_default()
+    }
+
+    /// #116: the Scale fields show a flipped (negative) or very large scale as it is. Showing
+    /// it never writes a clamped value back (that squashed a flipped shape to 1 %).
+    #[test]
+    fn showing_a_flipped_or_huge_scale_leaves_it_alone() {
+        let ctx = egui::Context::default();
+        let mut app = App::with_context(&ctx, Session::default(), Some(std::path::PathBuf::from("unused.png")));
+        app.run("draw.rect", json!({"x": 100, "y": 100, "w": 200, "h": 80}));
+        frames(&ctx, &mut app);
+        let b0 = app.s.selection_bounds();
+        app.run("modify.flip_v", json!({}));
+        frames(&ctx, &mut app);
+        let t = transform(&app);
+        assert!((t.m[0] - 1.0).abs() < 1e-4 && (t.m[3] + 1.0).abs() < 1e-4, "flipped vertically, not squashed: {t:?}");
+        app.run("modify.flip_h", json!({}));
+        frames(&ctx, &mut app);
+        let t = transform(&app);
+        assert!((t.m[0] + 1.0).abs() < 1e-4 && (t.m[3] + 1.0).abs() < 1e-4, "flipped both ways: {t:?}");
+        let b1 = app.s.selection_bounds();
+        assert!((b1.width() - b0.width()).abs() < 0.5 && (b1.height() - b0.height()).abs() < 0.5, "same size: {b0:?} vs {b1:?}");
+        // Bigger than the fields' range (10000 %): kept too.
+        app.run("modify.transform", json!({"a": 150, "b": 0, "c": 0, "d": 150, "e": 0, "f": 0}));
+        frames(&ctx, &mut app);
+        let t = transform(&app);
+        assert!((t.m[0] + 150.0).abs() < 1e-2 && (t.m[3] + 150.0).abs() < 1e-2, "{t:?}");
+        // A scale of zero is still refused, and leaves the shape as it was.
+        assert!(app.s.execute("element.set_transform", &json!({"sy": 0})).is_err());
+        assert!(app.s.execute("modify.transform", &json!({"a": 1, "b": 0, "c": 0, "d": 0, "e": 0, "f": 0})).is_err());
+        assert_eq!(transform(&app), t);
+    }
+
+    /// #310, #371: a flipped symbol instance (a "sprite") keeps its flip with Properties
+    /// showing, closed and opened again, and one undo takes the flip back for good. In 0.2.1
+    /// the panel wrote Scale Y = 1 % back every frame, squashing it and undoing the undo.
+    #[test]
+    fn a_flipped_symbol_instance_survives_the_properties_panel_and_undoes() {
+        let ctx = egui::Context::default();
+        let mut app = App::with_context(&ctx, Session::default(), Some(std::path::PathBuf::from("unused.png")));
+        app.run("draw.rect", json!({"x": 100, "y": 100, "w": 200, "h": 80}));
+        app.run("modify.convert_to_symbol", json!({"name": "Sprite"}));
+        frames(&ctx, &mut app);
+        let (t0, b0) = (transform(&app), app.s.selection_bounds());
+        app.run("modify.flip_h", json!({}));
+        frames(&ctx, &mut app);
+        let flipped = transform(&app);
+        assert!((flipped.determinant() + t0.determinant()).abs() < 1e-4, "mirrored, same size: {flipped:?}");
+        // Properties closed, the instance picked again, Properties opened: nothing changes.
+        app.toggle_panel(crate::dock::Panel::Properties);
+        frames(&ctx, &mut app);
+        app.run("edit.deselect", json!({}));
+        app.run("edit.select_all", json!({}));
+        app.toggle_panel(crate::dock::Panel::Properties);
+        frames(&ctx, &mut app);
+        frames(&ctx, &mut app);
+        assert_eq!(transform(&app), flipped, "showing the panel left the flip alone");
+        let b1 = app.s.selection_bounds();
+        assert!((b1.width() - b0.width()).abs() < 0.5 && (b1.height() - b0.height()).abs() < 0.5, "not squashed: {b0:?} vs {b1:?}");
+        // One undo, and it stays undone with the panel on screen.
+        app.run("edit.undo", json!({}));
+        frames(&ctx, &mut app);
+        assert_eq!(transform(&app), t0);
+        frames(&ctx, &mut app);
+        assert_eq!(transform(&app), t0, "the panel does not squash it again after the undo");
+    }
+
+    /// #393: the Stroke row has a checkbox like Fill, and the width stops at a hairline. A
+    /// stroke thinner than that (an import) is shown, never written back thicker.
+    #[test]
+    fn showing_a_stroke_thinner_than_a_hairline_leaves_it_alone() {
+        let ctx = egui::Context::default();
+        let mut app = App::with_context(&ctx, Session::default(), Some(std::path::PathBuf::from("unused.png")));
+        app.run("draw.rect", json!({"x": 100, "y": 100, "w": 200, "h": 80, "stroke": "#000000", "stroke_width": 0.05, "object": true}));
+        let width = |app: &App| match app.s.visible_elements().first().map(|e| e.kind.clone()) {
+            Some(ElementKind::Shape(sh)) => sh.stroke.map(|s| s.width),
+            _ => None,
+        };
+        let state = app.s.state;
+        frames(&ctx, &mut app);
+        assert_eq!(width(&app), Some(0.05));
+        assert_eq!(app.s.state, state, "showing it is not an edit");
+        // The checkbox's command: off, and on again with the same stroke.
+        app.run("element.set_stroke", json!({"on": false}));
+        frames(&ctx, &mut app);
+        assert_eq!(width(&app), None);
+        app.run("element.set_stroke", json!({"on": true}));
+        frames(&ctx, &mut app);
+        assert_eq!(width(&app), Some(0.05));
+    }
+
+    /// #116: dragging the bottom edge of the transform box up past the top edge mirrors the
+    /// shape; the Properties panel doesn't squash it back to 1 %.
+    #[test]
+    fn dragging_an_edge_past_the_opposite_one_mirrors() {
+        let ctx = egui::Context::default();
+        let mut app = App::with_context(&ctx, Session::default(), Some(std::path::PathBuf::from("unused.png")));
+        app.run("draw.rect", json!({"x": 0, "y": 0, "w": 100, "h": 50}));
+        frames(&ctx, &mut app);
+        // The bottom edge goes from y 50 to y -50, past the top edge.
+        let m = crate::stage::xf_total(
+            crate::app::XfKind::Scale { hx: 0, hy: 1 },
+            [0.0, 0.0, 100.0, 50.0],
+            egui::pos2(50.0, 50.0),
+            egui::pos2(50.0, -50.0),
+            false,
+            false,
+        );
+        assert!(m.m[3] < -0.5, "the drag itself mirrors: {m:?}");
+        let [a, b, c, d, e, f] = m.m;
+        assert!(app.s.execute("modify.transform", &json!({"a": a, "b": b, "c": c, "d": d, "e": e, "f": f})).is_ok());
+        frames(&ctx, &mut app);
+        let t = transform(&app);
+        assert!((t.m[0] - 1.0).abs() < 1e-4 && (t.m[3] - m.m[3]).abs() < 1e-3, "still mirrored as dragged: {t:?}");
     }
 }
